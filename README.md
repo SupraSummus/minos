@@ -3,7 +3,7 @@ MinOS
 
 Proof of concept of minimalistic, virtualization-friendly OS API.
 
- * vmnew() -> vmid
+ * vmnew(arch_spec...) -> vmid
  * vmforget(vmid_path, path_size)
  * vmls(vmid_path, path_size) -> ...
 
@@ -34,5 +34,5 @@ Proof of concept of minimalistic, virtualization-friendly OS API.
 
    Immediately terminate given thread.
 
- * thself() -> thid
+ * gettid() -> thid
  * thls(vmid_path, path_size) -> ...

@@ -12,7 +12,7 @@ all: hello.asm.elf hello.c.elf hello.asm.bin hello.c.bin
 %.asm.elf: %.asm.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
-%.c.elf: jump_start.asm.o /usr/lib/musl/lib/Scrt1.o %.c.o /lib/musl/lib/libc.a
+%.c.elf: jump_start.asm.o musl/lib/Scrt1.o %.c.o musl/lib/libc.a
 	$(LD) $(LDFLAGS) $(CLDFLAGS) -o $@ $^
 
 %.asm.o: %.S

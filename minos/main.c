@@ -95,7 +95,7 @@ int main () {
     /* parent is a tracer */
     fprintf(stderr, "child pid = %d\n", pid);
     waitpid(pid, 0, 0); // sync with PTRACE_TRACEME
-    ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_EXITKILL);
+    ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD);
     fprintf(stderr, "got child traced\n");
 
     // copy code into child memory
@@ -127,11 +127,11 @@ int main () {
     }
 
     for (int i = 0; i < 10; i ++) {
-        /* Enter next system call */
+        /* wait for next system call */
         if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1)
-            FATAL("%s", strerror(errno));
+            err(EXIT_FAILURE, "PTRACE_SYSEMU failed");
         if (waitpid(pid, 0, 0) == -1)
-            FATAL("%s", strerror(errno));
+            err(EXIT_FAILURE, "wait for PTRACE_SYSEMU failed");
 
         /* Gather system call arguments */
         struct user_regs_struct regs;
@@ -139,17 +139,39 @@ int main () {
             FATAL("%s", strerror(errno));
         long syscall = regs.orig_rax;
 
-        /* Print a representation of the system call */
-        fprintf(stderr, "%ld(%ld, %ld, %ld, %ld, %ld, %ld)",
+        bool pass_syscall = false;
+        switch (syscall) {
+            case SYS_write:
+            case SYS_read:
+            case SYS_exit:
+            case SYS_mmap:
+            case SYS_gettid:
+                pass_syscall = true;
+                break;
+            default:
+                pass_syscall = false;
+                break;
+        }
+
+        if (pass_syscall) {
+            fprintf(stderr, "syscall pass %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
                 syscall,
                 (long)regs.rdi, (long)regs.rsi, (long)regs.rdx,
                 (long)regs.r10, (long)regs.r8,  (long)regs.r9);
+        } else {
+            fprintf(stderr, "syscall drop %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
+                syscall,
+                (long)regs.rdi, (long)regs.rsi, (long)regs.rdx,
+                (long)regs.r10, (long)regs.r8,  (long)regs.r9);
+            regs.orig_rax = -1; // set to invalid syscall
+            ptrace(PTRACE_SETREGS, pid, 0, &regs);
+        }
 
         /* Run system call and stop on exit */
         if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1)
-            FATAL("%s", strerror(errno));
+            err(EXIT_FAILURE, "failed second PTRACE_SYSCALL");
         if (waitpid(pid, 0, 0) == -1)
-            FATAL("%s", strerror(errno));
+            err(EXIT_FAILURE, "failed to wait for second PTRACE_SYSCALL");
 
         /* Get system call result */
         if (ptrace(PTRACE_GETREGS, pid, 0, &regs) == -1) {
@@ -160,6 +182,6 @@ int main () {
         }
 
         /* Print system call result */
-        fprintf(stderr, " = %ld\n", (long)regs.rax);
+        fprintf(stderr, "syscall result = %ld\n", (long)regs.rax);
     }
 }
