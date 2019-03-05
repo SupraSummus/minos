@@ -1,3 +1,5 @@
+#include "consts.h"
+
 .section .text
 .globl purge
 .type purge, @function
@@ -8,7 +10,7 @@ purge:
 
 	// unmap everything
 	movq $11, %rax  // sys_munmap
-	movq $0x1000, %rdi  // start
+	movq $PAGE_SIZE, %rdi  // start
 	movq $0x7fffffffe000, %rsi  // len
 	syscall
 
@@ -20,8 +22,8 @@ purge:
 
 	// grow initial area to desired size (from first arg)
 	movq $25, %rax  // sys_mremap
-	movq $0x0, %rdi  // old addr
-	movq $0x1000, %rsi  // old len
+	movq $ENTRY_POINT, %rdi  // old addr
+	movq $PAGE_SIZE, %rsi  // old len
 	movq %r12, %rdx  // new len
 	movq $0, %r10  // flags
 	movq $0, %r8  // new addr
@@ -42,4 +44,4 @@ purge:
 	movq $0, %r10
 	syscall
 
-	.zero 0x1000  // padding for easy coping
+	.zero PAGE_SIZE  // padding for easy coping

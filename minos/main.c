@@ -1,39 +1,29 @@
 #define _GNU_SOURCE
 
-#include <stdlib.h>
-#include <stdbool.h>
+#include <assert.h>
 #include <err.h>
-#include <signal.h>
-#include <sys/mman.h>
-#include <sys/uio.h>
-
-/* C standard library */
-
 #include <errno.h>
-#include <stdio.h>
+#include <signal.h>
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-
-/* POSIX */
-#include <unistd.h>
+#include <syscall.h>
+#include <sys/mman.h>
+#include <sys/ptrace.h>
+#include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/user.h>
 #include <sys/wait.h>
-
-/* Linux */
-#include <syscall.h>
-#include <sys/ptrace.h>
+#include <unistd.h>
 
 #include "purge.h"
+#include "consts.h"
 
-#define FATAL(...) \
-    do { \
-        fprintf(stderr, "strace: " __VA_ARGS__); \
-        fputc('\n', stderr); \
-        exit(EXIT_FAILURE); \
-    } while (0)
 
 void * read_all(int fd, size_t * len, size_t * allocated) {
-    *allocated = sysconf(_SC_PAGESIZE);
+    *allocated = PAGE_SIZE;
     *len = 0;
     void * buf = mmap(
         NULL, *allocated,
@@ -58,26 +48,46 @@ void * read_all(int fd, size_t * len, size_t * allocated) {
     return buf;
 }
 
-int main () {
-    long page_size = sysconf(_SC_PAGESIZE);
+
+struct vm_t {
+    int id;
+    int rfd;
+    struct th_t * halted_threads;
+    struct th_t * threads;
+};
+
+
+struct th_t {
+    int id;
+    pid_t pid;
+    struct th_t * next;
+};
+
+
+int do_vmnew (struct vm_t * vm) {
+    assert(vm->threads == NULL);
+    assert(vm->halted_threads == NULL);
 
     // read program into local mem
     size_t program_size;
     size_t program_allocated;
-    void * program = read_all(STDIN_FILENO, &program_size, &program_allocated);
-    program_size = (program_size / page_size + 1) * page_size;  // TODO better rounding
+    void * program = read_all(vm->rfd, &program_size, &program_allocated);
+    close(vm->rfd);
+    vm->rfd = -1;
+    program_size = (program_size / PAGE_SIZE + 1) * PAGE_SIZE;  // TODO better rounding
     fprintf(stderr, "program loaded locally at %p, len %zu\n", program, program_size);
 
     // make child
     pid_t pid = fork();
     if (pid < 0) {
-        err(EXIT_FAILURE, "initial fork failed");
+        warn("initial fork failed");
+        return -1;
     }
 
     if (pid == 0) { /* child */
         // alloc zero-page
         if (mmap(
-            (void *)0, page_size,
+            ENTRY_POINT, PAGE_SIZE,
             PROT_READ | PROT_WRITE | PROT_EXEC,
             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
             -1, 0
@@ -86,8 +96,8 @@ int main () {
         }
 
         // copy bootstraping code there and execute it
-        memcpy((void *)0, purge, 0x1000);
-        ((void (*)(size_t))0)(program_size);
+        memcpy(ENTRY_POINT, purge, PAGE_SIZE);
+        ((void (*) (size_t))ENTRY_POINT)(program_size);
 
         errx(EXIT_FAILURE, "we shouldn't be here, oopsie");
     }
@@ -103,7 +113,7 @@ int main () {
     local_io.iov_base = program;
     local_io.iov_len = program_size;
     struct iovec remote_io;
-    remote_io.iov_base = (void *)0;
+    remote_io.iov_base = ENTRY_POINT;
     remote_io.iov_len = program_size;
     if (process_vm_writev(
         pid,
@@ -115,28 +125,70 @@ int main () {
     }
     fprintf(stderr, "program copied to child\n");
 
-    // resume child execution
-    fprintf(stderr, "resuming child execution\n");
+    // release parent code memory
+    munmap(program, program_allocated);
+
+    // append halted thread info
+    struct th_t * th = malloc(sizeof(struct th_t));
+    th->id = -1;
+    th->pid = pid;
+    th->next = vm->halted_threads;
+    vm->halted_threads = th;
+
+    return 0;
+}
+
+int do_thnew(struct vm_t * vm) {
+    if (vm->halted_threads == NULL) {
+        warnx("multiple threads are unsupported yet");
+        return -1;
+    }
+    struct th_t * th = vm->halted_threads;
+    th->id = 0;
+    vm->halted_threads = th->next;
+    th->next = vm->threads;
+    vm->threads = th;
+
+    // set thread register to start from entrypoint
     struct user_regs_struct regs;
-    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1) {
+    if (ptrace(PTRACE_GETREGS, th->pid, NULL, &regs) == -1) {
         err(EXIT_FAILURE, "failed to get child registers");
     }
-    regs.rip = 0;
-    if (ptrace(PTRACE_SETREGS, pid, NULL, &regs) == -1) {
+    regs.rip = ENTRY_POINT;
+    if (ptrace(PTRACE_SETREGS, th->pid, NULL, &regs) == -1) {
         err(EXIT_FAILURE, "failed to set child registers");
     }
 
+    // resume execution
+    if (ptrace(PTRACE_SYSCALL, th->pid, 0, 0) == -1)
+        err(EXIT_FAILURE, "failed second PTRACE_SYSCALL");
+
+    return 0;
+}
+
+int main () {
+    struct vm_t vm;
+    vm.id = 0;
+    vm.rfd = STDIN_FILENO;
+    vm.threads = NULL;
+    vm.halted_threads = NULL;
+
+    do_vmnew(&vm);
+    do_thnew(&vm);
+
     for (int i = 0; i < 10; i ++) {
+        siginfo_t siginfo;
+
         /* wait for next system call */
-        if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1)
-            err(EXIT_FAILURE, "PTRACE_SYSEMU failed");
-        if (waitpid(pid, 0, 0) == -1)
-            err(EXIT_FAILURE, "wait for PTRACE_SYSEMU failed");
+        if (waitid(P_ALL, 0, &siginfo, WSTOPPED) == -1)
+            err(EXIT_FAILURE, "wait for child syscall failed");
+
+        pid_t pid = siginfo.si_pid;
 
         /* Gather system call arguments */
         struct user_regs_struct regs;
         if (ptrace(PTRACE_GETREGS, pid, 0, &regs) == -1)
-            FATAL("%s", strerror(errno));
+            err(EXIT_FAILURE, "failed to get child registers");
         long syscall = regs.orig_rax;
 
         bool pass_syscall = false;
@@ -175,13 +227,19 @@ int main () {
 
         /* Get system call result */
         if (ptrace(PTRACE_GETREGS, pid, 0, &regs) == -1) {
-            fputs(" = ?\n", stderr);
-            if (errno == ESRCH)
-                exit(regs.rdi); // system call was _exit(2) or similar
-            FATAL("%s", strerror(errno));
+            if (errno == ESRCH) {
+                // system call was _exit(2) or similar
+                fprintf(stderr, "child exited with code %llu\n", regs.rdi);
+                exit(regs.rdi);
+            }
+            err(EXIT_FAILURE, "failed to get child registers after syscall");
         }
 
         /* Print system call result */
         fprintf(stderr, "syscall result = %ld\n", (long)regs.rax);
+
+        // resume execution
+        if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1)
+            err(EXIT_FAILURE, "failed PTRACE_SYSCALL");
     }
 }

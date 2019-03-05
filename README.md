@@ -1,38 +1,39 @@
 MinOS
 -----
 
-Proof of concept of minimalistic, virtualization-friendly OS API.
+Proof of concept of minimalistic, heterogenous, virtualization-friendly OS API.
 
- * vmnew(arch_spec...) -> vmid
- * vmforget(vmid_path, path_size)
- * vmls(vmid_path, path_size) -> ...
+ * vmnew(arch_spec...) -> vmid, wfd
+ 
+   Create new virtual memory space. Memory is filled with data written to rfd (begining at architecture-specific addr).
+ 
+ * vmforget(vmid)
 
  * fifonew() -> (wfd, rfd)
- * write(wfd, vmid_path, path_size, addr, size) -> success
+ * write(wfd, addr, size) -> success
 
-   Atomicaly write exactly `size` bytes from `addr` to `wfd`, where `addr` is in given virtual memory space (`vmid_path`, `path_size`). Return if this was sucessful (or possibly error code).
+   Atomicaly write exactly `size` bytes from `addr` to `wfd`. Return if this was sucessful (or possibly error code).
 
- * read(rfds, rfdcount, vmid_path, path_size, addr, size) -> (rfd, size)
+ * read(rfds, rfdcount, addr, size) -> (rfd, size)
 
-   Read up to `size` bytes into `addr` (under given virtual memory) from one of read-fds specified in table (`rfds` and `rfdcount`). Return count of bytes read and read-fd read from. Number of bytes read is 0 only if all rfds are forever empty.
+   Read up to `size` bytes into `addr` from one of read-fds specified in table (`rfds` and `rfdcount`). Return count of bytes read and read-fd read from. Number of bytes read is 0 only if all rfds are forever empty.
 
  * wforget(wfd)
  * rforget(rfd)
 
    Mark file descriptors as unused in current space in the future.
 
- * wdelegate(wfd, vmid_path, path_size) -> child_wfd
- * rdelegate(rfd, wmid_path, path_size) -> child_rfd
+ * wpass(wfd, vmid) -> child_wfd
+ * rpass(rfd, vmid) -> child_rfd
 
    Pass descriptor to child space. Descripor there will be visible under new id.
 
- * thnew(vmid_path, path_size, addr) -> thid
+ * thnew(vmid) -> thid
 
-   Create new thread in given virtual memory space. Start execution at `addr`. Return created thread's id.
+   Create new thread in given virtual memory space. Start execution at addr specific for vm's architecture. Return created thread's id.
 
- * thend(vmid_path, path_size, thid)
+ * thend(vmid, thid)
 
    Immediately terminate given thread.
 
  * gettid() -> thid
- * thls(vmid_path, path_size) -> ...
