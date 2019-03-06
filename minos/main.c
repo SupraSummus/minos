@@ -140,7 +140,7 @@ int do_vmnew (struct vm_t * vm) {
 
 int do_thnew(struct vm_t * vm) {
     if (vm->halted_threads == NULL) {
-        warnx("multiple threads are unsupported yet");
+        warnx("multiple threads are not supported yet");
         return -1;
     }
     struct th_t * th = vm->halted_threads;
@@ -166,17 +166,10 @@ int do_thnew(struct vm_t * vm) {
     return 0;
 }
 
-int main () {
-    struct vm_t vm;
-    vm.id = 0;
-    vm.rfd = STDIN_FILENO;
-    vm.threads = NULL;
-    vm.halted_threads = NULL;
+void handle_syscalls() {
+    int alive = 1;
 
-    do_vmnew(&vm);
-    do_thnew(&vm);
-
-    for (int i = 0; i < 10; i ++) {
+    while (alive > 0) {
         siginfo_t siginfo;
 
         /* wait for next system call */
@@ -191,6 +184,13 @@ int main () {
             err(EXIT_FAILURE, "failed to get child registers");
         long syscall = regs.orig_rax;
 
+        // detect killed child
+        if (!(siginfo.si_status & 0x80)) {
+            alive--;
+            fprintf(stderr, "%d killed at %p\n", pid, regs.rip);
+            continue;
+        }
+
         bool pass_syscall = false;
         switch (syscall) {
             case SYS_write:
@@ -198,6 +198,7 @@ int main () {
             case SYS_exit:
             case SYS_mmap:
             case SYS_gettid:
+            case SYS_arch_prctl:
                 pass_syscall = true;
                 break;
             default:
@@ -206,12 +207,14 @@ int main () {
         }
 
         if (pass_syscall) {
-            fprintf(stderr, "syscall pass %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
+            fprintf(stderr, "%d pass syscall %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
+                pid,
                 syscall,
                 (long)regs.rdi, (long)regs.rsi, (long)regs.rdx,
                 (long)regs.r10, (long)regs.r8,  (long)regs.r9);
         } else {
-            fprintf(stderr, "syscall drop %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
+            fprintf(stderr, "%d drop syscall %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
+                pid,
                 syscall,
                 (long)regs.rdi, (long)regs.rsi, (long)regs.rdx,
                 (long)regs.r10, (long)regs.r8,  (long)regs.r9);
@@ -242,4 +245,17 @@ int main () {
         if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1)
             err(EXIT_FAILURE, "failed PTRACE_SYSCALL");
     }
+}
+
+int main () {
+    struct vm_t vm;
+    vm.id = 0;
+    vm.rfd = STDIN_FILENO;
+    vm.threads = NULL;
+    vm.halted_threads = NULL;
+
+    do_vmnew(&vm);
+    do_thnew(&vm);
+
+    handle_syscalls();
 }

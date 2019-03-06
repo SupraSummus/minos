@@ -5,5 +5,6 @@ static int i;
 
 int main() {
 	printf("hello world\n");
+	i++;
 	return EXIT_SUCCESS;
 }

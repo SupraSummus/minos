@@ -1,5 +1,5 @@
 CC = cc
-CFLAGS = -Wall -Wextra -Imusl/include -Imusl/obj/include -Imusl/arch/x86_64
+CFLAGS = -Wall -Wextra -Imusl/include -Imusl/obj/include -Imusl/arch/x86_64 -mno-tls-direct-seg-refs
 LD = ld
 LDFLAGS = -static -nostdlib --section-start .init=0
 CLDFLAGS = -e __setup_stack_and_start
