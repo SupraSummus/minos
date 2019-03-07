@@ -1,39 +1,56 @@
 MinOS
------
+=====
 
 Proof of concept of minimalistic, heterogenous, virtualization-friendly OS API.
 
- * vmnew(arch_spec...) -> vmid, wfd
- 
-   Create new virtual memory space. Memory is filled with data written to rfd (begining at architecture-specific addr).
- 
- * vmforget(vmid)
+Minos specifies simple API for spawning controlably interconnected computational continers. Each container can operate under its specific architecture. For example several can be executed as x86-64 code, and others as JVM bytecode. Minos architecture doesn't put hard limits on range of possible environments. Only requirements are:
 
- * fifonew() -> (wfd, rfd)
- * write(wfd, addr, size) -> success
+ * code and application state must be serializable into octet stream (bytes)
+ * environment must somehow expose minos API to running application - for example it is `syscall` asm instruction on x86-64 platform
+ * execution environment must sandbox code running inside, allowing for execution of untrusted programs (in terms of privilege escalation; protection against DoS attacks are not yet proposed)
 
-   Atomicaly write exactly `size` bytes from `addr` to `wfd`. Return if this was sucessful (or possibly error code).
+Communications between containers is asynchronous, via reliable, ordered byte streams, like TCP or UNIX pipe, but minos abstracts that by use of file descriptors. Descriptors are of two types: write-only or read-only. Descriptors can be passed between containers, but single descriptor can be used in at most one container at a time.
+
+General, architecture independant syscalls
+------------------------------------------
+
+ * cnew(arch_spec...) -> vmid, wfd
+
+   Create new virtual memory space. Memory is filled with data written to wfd (begining at architecture-specific addr) and then executed.
+
+ * ckill(vmid)
+
+ * pipe() -> (wfd, rfd)
+ * write(wfd, addr, size) -> count
+
+   Write at most `size` bytes from `addr` to `wfd`. Return count writen.
 
  * read(rfds, rfdcount, addr, size) -> (rfd, size)
 
-   Read up to `size` bytes into `addr` from one of read-fds specified in table (`rfds` and `rfdcount`). Return count of bytes read and read-fd read from. Number of bytes read is 0 only if all rfds are forever empty.
+   Read up to `size` bytes into `addr` from one of read-fds specified in table (`rfds` and `rfdcount`). Return count of bytes read and read-fd read from. Number of bytes read is 0 only if selected rfd is forever empty.
 
- * wforget(wfd)
- * rforget(rfd)
-
-   Mark file descriptors as unused in current space in the future.
+ * wclose(wfd)
+ * rclose(rfd)
 
  * wpass(wfd, vmid) -> child_wfd
  * rpass(rfd, vmid) -> child_rfd
 
-   Pass descriptor to child space. Descripor there will be visible under new id.
+   Pass descriptor to child space. Descripor there will be visible under new id. Descriptor becomes unaccesible in calling container.
 
- * thnew(vmid) -> thid
+Architecture specific container state
+-------------------------------------
 
-   Create new thread in given virtual memory space. Start execution at addr specific for vm's architecture. Return created thread's id.
+ * arch_prctl - for example for setting FS, GS register
 
- * thend(vmid, thid)
+Paged memory management
+-----------------------
 
-   Immediately terminate given thread.
+ * linux-like mmap/mremap/munmap/mprotect
 
- * gettid() -> thid
+   mmap is for anonymous-only pages
+
+Threads
+-------
+
+ * clone/exit/gettid/...
+ * linux-like futex
