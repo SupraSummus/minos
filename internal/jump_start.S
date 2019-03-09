@@ -15,7 +15,7 @@ __setup_stack_and_start:
 	mov $0, %r9 // fd offset
 	syscall
 
-	// stack base is at the end of mapped page
+	// stack base is at the end of mapped area
 	add $STACK_SIZE, %rax
 	mov %rax, %rsp
 

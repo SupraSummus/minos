@@ -14,11 +14,11 @@ Communications between containers is asynchronous, via reliable, ordered byte st
 General, architecture independant syscalls
 ------------------------------------------
 
- * cnew(arch_spec...) -> vmid, wfd
+ * cnew(code_rfd, arch_spec...) -> cid
 
    Create new virtual memory space. Memory is filled with data written to wfd (begining at architecture-specific addr) and then executed.
 
- * ckill(vmid)
+ * ckill(cid)
 
  * pipe() -> (wfd, rfd)
  * write(wfd, addr, size) -> count

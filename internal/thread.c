@@ -4,7 +4,7 @@
 #include <err.h>
 
 void * thread_main(void * arg) {
-	printf("hello world, arg %lld\n", (long long)arg);
+	printf("%lld\n", (long long)arg);
 	if ((long long)arg > 0) {
 		pthread_t threads[2];
 		if (

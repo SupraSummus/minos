@@ -23,6 +23,9 @@
 #include "consts.h"
 
 
+static const bool DEBUG = false;
+
+
 void * read_all(int fd, size_t * len, size_t * allocated) {
     // first allocate single page
     *allocated = PAGE_SIZE;
@@ -106,7 +109,7 @@ bool do_cnew (struct vm_t * vm) {
     close(vm->rfd);
     vm->rfd = -1;
     program_size = (program_size / PAGE_SIZE + 1) * PAGE_SIZE;  // TODO better rounding
-    fprintf(stderr, "program loaded locally at %p, len %zu\n", program, program_size);
+    if (DEBUG) fprintf(stderr, "program loaded locally at %p, len %zu\n", program, program_size);
 
     // make child
     pid_t pid = fork();
@@ -134,7 +137,7 @@ bool do_cnew (struct vm_t * vm) {
 
         // copy bootstraping code there and execute it
         memcpy((void *)ENTRY_POINT, purge, PAGE_SIZE);
-        fprintf(stderr, "executing bootstraping code copied to %p\n", (void *)ENTRY_POINT);
+        if (DEBUG) fprintf(stderr, "executing bootstraping code copied to %p\n", (void *)ENTRY_POINT);
         ((void (*) (size_t))ENTRY_POINT)(program_size);
 
         // we shouldn't be here
@@ -142,7 +145,7 @@ bool do_cnew (struct vm_t * vm) {
     }
 
     /* parent is a tracer */
-    fprintf(stderr, "child pid = %d\n", pid);
+    if (DEBUG) fprintf(stderr, "child pid = %d\n", pid);
     if (
         (waitpid(pid, 0, 0) == -1) |  // sync with PTRACE_TRACEME
         !set_ptrace_options(pid)
@@ -151,7 +154,7 @@ bool do_cnew (struct vm_t * vm) {
         munmap(program, program_allocated);
         return false;
     }
-    fprintf(stderr, "got child traced\n");
+    if (DEBUG) fprintf(stderr, "got child traced\n");
 
     // copy code into child memory
     struct iovec local_io;
@@ -171,7 +174,7 @@ bool do_cnew (struct vm_t * vm) {
         munmap(program, program_allocated);
         return false;
     }
-    fprintf(stderr, "program copied to child\n");
+    if (DEBUG) fprintf(stderr, "program copied to child\n");
 
     // release parent code memory
     munmap(program, program_allocated);
@@ -208,32 +211,6 @@ bool do_cnew (struct vm_t * vm) {
     return 0;
 }
 
-void handle_syscall_exit (struct th_t * * th_p) {
-    struct th_t * th = *th_p;
-
-    /* Get system call result */
-    struct user_regs_struct regs;
-    if (ptrace(PTRACE_GETREGS, th->tid, 0, &regs) == -1) {
-        if (errno == ESRCH) {
-            // system call was _exit(2) or similar
-            fprintf(stderr, "%d exited with code %llu\n", th->tid, regs.rdi);
-            *th_p = th->next;
-            free(th);
-            return;
-        } else {
-            err(EXIT_FAILURE, "failed to get child registers after syscall");
-        }
-    }
-
-    /* Print system call result */
-    fprintf(stderr, "%d syscall result = %ld (%ld)\n", th->tid, (long)regs.rax, (long)regs.orig_rax);
-
-    // resume execution
-    th->in_syscall = false;
-    if (ptrace(PTRACE_SYSCALL, th->tid, 0, 0) == -1)
-        err(EXIT_FAILURE, "failed PTRACE_SYSCALL");
-
-}
 
 void handle_syscalls(struct vm_t * vm) {
 
@@ -254,7 +231,7 @@ void handle_syscalls(struct vm_t * vm) {
 
         if (th->tid != pid) {
             // we dont know this thread - it's a new thread coming from clone()
-            fprintf(stderr, "%d is a new thread\n", pid);
+            if (DEBUG) fprintf(stderr, "%d is a new thread\n", pid);
 
             // add to thread list
             struct th_t * new_th = malloc(sizeof(struct th_t));
@@ -266,11 +243,11 @@ void handle_syscalls(struct vm_t * vm) {
 
         } else if (siginfo.si_status == (SIGTRAP | (PTRACE_EVENT_CLONE << 8))) {
             // new thread observed from previous old thread
-            fprintf(stderr, "%d PTRACE_EVENT_CLONE\n", pid);
+            if (DEBUG) fprintf(stderr, "%d PTRACE_EVENT_CLONE\n", pid);
 
         } else if (siginfo.si_status == (SIGTRAP | (PTRACE_EVENT_EXIT << 8))) {
             // thread termination
-            fprintf(stderr, "%d PTRACE_EVENT_EXIT\n", pid);
+            if (DEBUG) fprintf(stderr, "%d PTRACE_EVENT_EXIT\n", pid);
             *th_p = th->next;
             free(th);
 
@@ -337,13 +314,13 @@ void handle_syscalls(struct vm_t * vm) {
                 }
 
                 if (pass_syscall) {
-                    /*fprintf(stderr, "%d pass %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
+                    /*if (DEBUG) fprintf(stderr, "%d pass %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
                         pid,
                         syscall,
                         (long)regs.rdi, (long)regs.rsi, (long)regs.rdx,
                         (long)regs.r10, (long)regs.r8,  (long)regs.r9);*/
                 } else {
-                    fprintf(stderr, "%d droping syscall %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
+                    if (DEBUG) fprintf(stderr, "%d droping syscall %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
                         pid,
                         syscall,
                         (long)regs.rdi, (long)regs.rsi, (long)regs.rdx,
