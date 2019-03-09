@@ -213,8 +213,10 @@ bool do_cnew (struct vm_t * vm) {
 
 
 void handle_syscalls(struct vm_t * vm) {
+    int untraced = 0;  // number of threads spawned, but untraced yet
+    int thread_count = 1;  // just for debugging
 
-    while (vm->threads != NULL) {
+    while (vm->threads != NULL || untraced != 0) {
         siginfo_t siginfo;
 
         /* wait for next system call or exit from syscall */
@@ -224,14 +226,13 @@ void handle_syscalls(struct vm_t * vm) {
         // get relevant thread
         pid_t pid = siginfo.si_pid;
         struct th_t * * th_p = &(vm->threads);
-        assert(*th_p != NULL);
-        while ((*th_p)->tid != pid && (*th_p)->next != NULL)
+        while (*th_p != NULL && (*th_p)->tid != pid)
             th_p = &((*th_p)->next);
         struct th_t * th = *th_p;
 
-        if (th->tid != pid) {
+        if (th == NULL) {
             // we dont know this thread - it's a new thread coming from clone()
-            if (DEBUG) fprintf(stderr, "%d is a new thread\n", pid);
+            untraced --;
 
             // add to thread list
             struct th_t * new_th = malloc(sizeof(struct th_t));
@@ -240,16 +241,21 @@ void handle_syscalls(struct vm_t * vm) {
             new_th->in_syscall = false;
             new_th->next = th;
             *th_p = new_th;
+            thread_count ++;
+
+            if (DEBUG) fprintf(stderr, "%d is a new thread, untraced %d, traced %d\n", pid, untraced, thread_count);
 
         } else if (siginfo.si_status == (SIGTRAP | (PTRACE_EVENT_CLONE << 8))) {
             // new thread observed from previous old thread
-            if (DEBUG) fprintf(stderr, "%d PTRACE_EVENT_CLONE\n", pid);
+            untraced ++;
+            if (DEBUG) fprintf(stderr, "%d PTRACE_EVENT_CLONE, untraced %d\n", pid, untraced);
 
         } else if (siginfo.si_status == (SIGTRAP | (PTRACE_EVENT_EXIT << 8))) {
             // thread termination
-            if (DEBUG) fprintf(stderr, "%d PTRACE_EVENT_EXIT\n", pid);
             *th_p = th->next;
             free(th);
+            thread_count --;
+            if (DEBUG) fprintf(stderr, "%d PTRACE_EVENT_EXIT, traced %d\n", pid, thread_count);
 
         } else if (siginfo.si_status == (SIGTRAP | 0x80)) {
             // PTRACE_O_TRACESYSGOOD stop
@@ -304,7 +310,6 @@ void handle_syscalls(struct vm_t * vm) {
                     case SYS_set_tid_address:
                     case SYS_arch_prctl:
                     case SYS_futex:
-                    //case SYS_rt_sigprocmask: // temporary
                         pass_syscall = true;
                         break;
 
@@ -314,11 +319,11 @@ void handle_syscalls(struct vm_t * vm) {
                 }
 
                 if (pass_syscall) {
-                    /*if (DEBUG) fprintf(stderr, "%d pass %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
+                    if (DEBUG) fprintf(stderr, "%d pass %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
                         pid,
                         syscall,
                         (long)regs.rdi, (long)regs.rsi, (long)regs.rdx,
-                        (long)regs.r10, (long)regs.r8,  (long)regs.r9);*/
+                        (long)regs.r10, (long)regs.r8,  (long)regs.r9);
                 } else {
                     if (DEBUG) fprintf(stderr, "%d droping syscall %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
                         pid,
@@ -337,9 +342,11 @@ void handle_syscalls(struct vm_t * vm) {
         ) { 
             // killed child
             unsigned long rip = ptrace(PTRACE_PEEKUSER, pid, offsetof(struct user, regs.rip), 0, 0);
-            fprintf(stderr, "%d killed at %p\n", pid, (void *)rip);
             *th_p = th->next;
             free(th);
+            thread_count--;
+
+            fprintf(stderr, "%d killed at %p, traced %d\n", pid, (void *)rip, thread_count);
 
         } else {
             errx(
@@ -355,6 +362,10 @@ void handle_syscalls(struct vm_t * vm) {
         if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1)
             err(EXIT_FAILURE, "failed PTRACE_SYSCALL");
     }
+
+    if (vm->threads != NULL) warnx("exiting with notempty thread list");
+    if (untraced != 0) warnx("exiting with nonzero untraced threads count");
+    if (thread_count != 0) warnx("exiting with nonzero traced threads count");
 }
 
 int main () {
@@ -365,6 +376,6 @@ int main () {
     vm.next = NULL;
 
     do_cnew(&vm);
-
     handle_syscalls(&vm);
+    return EXIT_SUCCESS;
 }

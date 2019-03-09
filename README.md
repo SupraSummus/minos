@@ -1,6 +1,8 @@
 MinOS
 =====
 
+[![Build Status](https://travis-ci.com/SupraSummus/minos.svg?branch=master)](https://travis-ci.com/SupraSummus/minos)
+
 Proof of concept of minimalistic, heterogenous, virtualization-friendly OS API.
 
 Minos specifies simple API for spawning controlably interconnected computational continers. Each container can operate under its specific architecture. For example several can be executed as x86-64 code, and others as JVM bytecode. Minos architecture doesn't put hard limits on range of possible environments. Only requirements are:
