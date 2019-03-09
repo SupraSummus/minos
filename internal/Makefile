@@ -1,13 +1,13 @@
 CC = cc
-CFLAGS = -Wall -Wextra -Imusl/include -Imusl/obj/include -Imusl/arch/x86_64 -mno-tls-direct-seg-refs
+CFLAGS = -Wall -Wextra -Imusl/include -Imusl/obj/include -Imusl/arch/x86_64
 LD = ld
-LDFLAGS = -static -nostdlib --section-start .init=0
+LDFLAGS = -static -nostdlib --section-start .init=0x10000
 CLDFLAGS = -e __setup_stack_and_start
 
 all: hello.asm.elf hello.c.elf hello.asm.bin hello.c.bin thread.c.elf thread.c.bin
 
 %.bin: %.elf
-	cp $< $@; objcopy -O binary $@
+	cp $< $@; objcopy -O binary -R .note.gnu.property $@
 
 %.asm.elf: %.asm.o
 	$(LD) $(LDFLAGS) -o $@ $^

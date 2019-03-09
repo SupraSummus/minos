@@ -67,17 +67,41 @@ void * read_all(int fd, size_t * len, size_t * allocated) {
 struct vm_t {
     int id;
     int rfd;
+    struct th_t * threads;
+    struct vm_t * next;
 };
 
 
-int do_cnew (struct vm_t * vm) {
+struct th_t {
+    pid_t tid;
+    bool in_syscall;
+    struct th_t * next;
+};
+
+
+bool set_ptrace_options(pid_t pid) {
+    if (ptrace(
+        PTRACE_SETOPTIONS, pid, 0,
+        PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXIT
+    ) != 0) {
+        warn("failed PTRACE_SETOPTIONS");
+        return false;
+    } else {
+        return true;
+    }
+}
+
+
+bool do_cnew (struct vm_t * vm) {
+    assert(vm->threads == NULL);
+
     // read program into local mem
     size_t program_size;
     size_t program_allocated;
     void * program = read_all(vm->rfd, &program_size, &program_allocated);
     if (program == NULL) {
         warn("reading program code failed");
-        return -1;
+        return false;
     }
     close(vm->rfd);
     vm->rfd = -1;
@@ -88,24 +112,29 @@ int do_cnew (struct vm_t * vm) {
     pid_t pid = fork();
     if (pid < 0) {
         warn("initial fork failed");
-        return -1;
+        munmap(program, program_allocated);
+        return false;
     }
 
     if (pid == 0) { /* child */
-        // alloc zero-page
+        // space for boostraping code
         if (mmap(
-            ENTRY_POINT, PAGE_SIZE,
+            (void *)ENTRY_POINT, PAGE_SIZE,
             PROT_READ | PROT_WRITE | PROT_EXEC,
             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
             -1, 0
         ) == MAP_FAILED) {
-            warn("failed to mmap zero-page (check your /proc/sys/vm/mmap_min_addr)");
-            munmap(program, program_allocated);
-            return -1;
+            err(
+                EXIT_FAILURE,
+                "failed to mmap page at %p (check your /proc/sys/vm/mmap_min_addr)",
+                (void *)ENTRY_POINT
+            );
+            return false;
         }
 
         // copy bootstraping code there and execute it
-        memcpy(ENTRY_POINT, purge, PAGE_SIZE);
+        memcpy((void *)ENTRY_POINT, purge, PAGE_SIZE);
+        fprintf(stderr, "executing bootstraping code copied to %p\n", (void *)ENTRY_POINT);
         ((void (*) (size_t))ENTRY_POINT)(program_size);
 
         // we shouldn't be here
@@ -114,8 +143,14 @@ int do_cnew (struct vm_t * vm) {
 
     /* parent is a tracer */
     fprintf(stderr, "child pid = %d\n", pid);
-    waitpid(pid, 0, 0); // sync with PTRACE_TRACEME
-    ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD);
+    if (
+        (waitpid(pid, 0, 0) == -1) |  // sync with PTRACE_TRACEME
+        !set_ptrace_options(pid)
+    ) {
+        kill(pid, SIGKILL);
+        munmap(program, program_allocated);
+        return false;
+    }
     fprintf(stderr, "got child traced\n");
 
     // copy code into child memory
@@ -123,7 +158,7 @@ int do_cnew (struct vm_t * vm) {
     local_io.iov_base = program;
     local_io.iov_len = program_size;
     struct iovec remote_io;
-    remote_io.iov_base = ENTRY_POINT;
+    remote_io.iov_base = (void *)ENTRY_POINT;
     remote_io.iov_len = program_size;
     if (process_vm_writev(
         pid,
@@ -131,7 +166,10 @@ int do_cnew (struct vm_t * vm) {
         &remote_io, 1,
         0
     ) != (ssize_t)program_size) {
-        err(EXIT_FAILURE, "failed to copy program to child");
+        warn("failed to copy program to child");
+        kill(pid, SIGKILL);
+        munmap(program, program_allocated);
+        return false;
     }
     fprintf(stderr, "program copied to child\n");
 
@@ -141,124 +179,200 @@ int do_cnew (struct vm_t * vm) {
     // set thread register to start from entrypoint
     if (ptrace(
         PTRACE_POKEUSER, pid,
-        offsetof(struct user, regs.rip), 0
+        offsetof(struct user, regs.rip), ENTRY_POINT
     ) == -1) {
         warn("failed to set child's %%RIP to entrypoint");
-        return -1;
+        kill(pid, SIGKILL);
+        return false;
     }
 
+    // register thread in the list
+    struct th_t * th = malloc(sizeof(struct th_t));
+    if (th == NULL) {
+        kill(pid, SIGKILL);
+        return false;
+    }
+    th->tid = pid;
+    th->in_syscall = false;
+    th->next = vm->threads;
+    vm->threads = th;
+
     // resume execution
-    if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1)
-        err(EXIT_FAILURE, "failed second PTRACE_SYSCALL");
+    if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1) {
+        kill(pid, SIGKILL);
+        vm->threads = th->next;
+        free(th);
+        return false;
+    }
 
     return 0;
 }
 
-void handle_syscalls() {
-    int alive = 1;
+void handle_syscall_exit (struct th_t * * th_p) {
+    struct th_t * th = *th_p;
 
-    while (alive > 0) {
+    /* Get system call result */
+    struct user_regs_struct regs;
+    if (ptrace(PTRACE_GETREGS, th->tid, 0, &regs) == -1) {
+        if (errno == ESRCH) {
+            // system call was _exit(2) or similar
+            fprintf(stderr, "%d exited with code %llu\n", th->tid, regs.rdi);
+            *th_p = th->next;
+            free(th);
+            return;
+        } else {
+            err(EXIT_FAILURE, "failed to get child registers after syscall");
+        }
+    }
+
+    /* Print system call result */
+    fprintf(stderr, "%d syscall result = %ld (%ld)\n", th->tid, (long)regs.rax, (long)regs.orig_rax);
+
+    // resume execution
+    th->in_syscall = false;
+    if (ptrace(PTRACE_SYSCALL, th->tid, 0, 0) == -1)
+        err(EXIT_FAILURE, "failed PTRACE_SYSCALL");
+
+}
+
+void handle_syscalls(struct vm_t * vm) {
+
+    while (vm->threads != NULL) {
         siginfo_t siginfo;
 
-        /* wait for next system call */
+        /* wait for next system call or exit from syscall */
         if (waitid(P_ALL, 0, &siginfo, WSTOPPED) == -1)
             err(EXIT_FAILURE, "wait for child syscall failed");
 
+        // get relevant thread
         pid_t pid = siginfo.si_pid;
+        struct th_t * * th_p = &(vm->threads);
+        assert(*th_p != NULL);
+        while ((*th_p)->tid != pid && (*th_p)->next != NULL)
+            th_p = &((*th_p)->next);
+        struct th_t * th = *th_p;
 
-        /* Gather system call arguments */
-        struct user_regs_struct regs;
-        if (ptrace(PTRACE_GETREGS, pid, 0, &regs) == -1)
-            err(EXIT_FAILURE, "failed to get child registers");
-        long syscall = regs.orig_rax;
+        if (th->tid != pid) {
+            // we dont know this thread - it's a new thread coming from clone()
+            fprintf(stderr, "%d is a new thread\n", pid);
 
-        // detect killed child
-        if (!(siginfo.si_status & 0x80)) {
-            alive--;
-            fprintf(stderr, "%d killed at %p\n", pid, regs.rip);
-            continue;
-        }
+            // add to thread list
+            struct th_t * new_th = malloc(sizeof(struct th_t));
+            if (new_th == NULL) err(EXIT_FAILURE, "malloc failed");
+            new_th->tid = pid;
+            new_th->in_syscall = false;
+            new_th->next = th;
+            *th_p = new_th;
 
-        bool pass_syscall = false;
-        int64_t word;
-        switch (syscall) {
-            case SYS_mmap:
-                // pass only when fd is -1 (we want to prevent real file maps)
-                word = ptrace(
-                    PTRACE_PEEKUSER, pid,
-                    offsetof(struct user, regs.r8), NULL
-                );
-                pass_syscall = (word == -1);
-                break;
+        } else if (siginfo.si_status == (SIGTRAP | (PTRACE_EVENT_CLONE << 8))) {
+            // new thread observed from previous old thread
+            fprintf(stderr, "%d PTRACE_EVENT_CLONE\n", pid);
 
-            case SYS_clone:
-                // check if flags are correct
-                word = ptrace(
-                    PTRACE_PEEKUSER, pid,
-                    offsetof(struct user, regs.rdi), NULL
-                );
-                pass_syscall = (
-                    (word & CLONE_FILES) &&
-                    !(word & CLONE_VFORK) &&
-                    (word & CLONE_VM)
-                );
-                break;
+        } else if (siginfo.si_status == (SIGTRAP | (PTRACE_EVENT_EXIT << 8))) {
+            // thread termination
+            fprintf(stderr, "%d PTRACE_EVENT_EXIT\n", pid);
+            *th_p = th->next;
+            free(th);
 
-            case SYS_write:
-            case SYS_read:
+        } else if (siginfo.si_status == (SIGTRAP | 0x80)) {
+            // PTRACE_O_TRACESYSGOOD stop
 
-            case SYS_mprotect:
-            case SYS_munmap:
-            case SYS_mremap:
-
-            case SYS_exit:
-            case SYS_gettid:
-            case SYS_arch_prctl:
-            case SYS_futex:
-                pass_syscall = true;
-                break;
-
-            default:
-                pass_syscall = false;
-                break;
-        }
-
-        if (pass_syscall) {
-            /*fprintf(stderr, "%d pass syscall %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
-                pid,
-                syscall,
-                (long)regs.rdi, (long)regs.rsi, (long)regs.rdx,
-                (long)regs.r10, (long)regs.r8,  (long)regs.r9);*/
-        } else {
-            fprintf(stderr, "%d drop syscall %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
-                pid,
-                syscall,
-                (long)regs.rdi, (long)regs.rsi, (long)regs.rdx,
-                (long)regs.r10, (long)regs.r8,  (long)regs.r9);
-            regs.orig_rax = -1; // set to invalid syscall
-            ptrace(PTRACE_SETREGS, pid, 0, &regs);
-        }
-
-        /* Run system call and stop on exit */
-        if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1)
-            err(EXIT_FAILURE, "failed second PTRACE_SYSCALL");
-        if (waitpid(pid, 0, 0) == -1)
-            err(EXIT_FAILURE, "failed to wait for second PTRACE_SYSCALL");
-
-        /* Get system call result */
-        if (ptrace(PTRACE_GETREGS, pid, 0, &regs) == -1) {
-            if (errno == ESRCH) {
-                // system call was _exit(2) or similar
-                fprintf(stderr, "child exited with code %llu\n", regs.rdi);
-                alive --;
-                continue;
+            if (th->in_syscall) {
+                // syscall exit
+                th->in_syscall = false;
             } else {
-                err(EXIT_FAILURE, "failed to get child registers after syscall");
-            }
-        }
+                // syscall enter
+                th->in_syscall = true;
 
-        /* Print system call result */
-        //fprintf(stderr, "syscall result = %ld\n", (long)regs.rax);
+                /* Gather system call arguments */
+                struct user_regs_struct regs;
+                if (ptrace(PTRACE_GETREGS, pid, 0, &regs) == -1)
+                    err(EXIT_FAILURE, "failed to get child registers");
+                long syscall = regs.orig_rax;
+
+                bool pass_syscall = false;
+                int64_t word;
+                switch (syscall) {
+                    case SYS_mmap:
+                        // pass only when fd is -1 (we want to prevent real file maps)
+                        word = ptrace(
+                            PTRACE_PEEKUSER, pid,
+                            offsetof(struct user, regs.r8), NULL
+                        );
+                        pass_syscall = (word == -1);
+                        break;
+
+                    case SYS_clone:
+                        // check if flags are correct
+                        word = ptrace(
+                            PTRACE_PEEKUSER, pid,
+                            offsetof(struct user, regs.rdi), NULL
+                        );
+                        pass_syscall = (
+                            (word & CLONE_FILES) &&
+                            !(word & CLONE_VFORK) &&
+                            (word & CLONE_VM)
+                        );
+                        break;
+
+                    case SYS_write:
+                    case SYS_read:
+
+                    case SYS_mprotect:
+                    case SYS_munmap:
+                    case SYS_mremap:
+
+                    case SYS_exit:
+                    case SYS_gettid:
+                    case SYS_set_tid_address:
+                    case SYS_arch_prctl:
+                    case SYS_futex:
+                    //case SYS_rt_sigprocmask: // temporary
+                        pass_syscall = true;
+                        break;
+
+                    default:
+                        pass_syscall = false;
+                        break;
+                }
+
+                if (pass_syscall) {
+                    /*fprintf(stderr, "%d pass %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
+                        pid,
+                        syscall,
+                        (long)regs.rdi, (long)regs.rsi, (long)regs.rdx,
+                        (long)regs.r10, (long)regs.r8,  (long)regs.r9);*/
+                } else {
+                    fprintf(stderr, "%d droping syscall %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
+                        pid,
+                        syscall,
+                        (long)regs.rdi, (long)regs.rsi, (long)regs.rdx,
+                        (long)regs.r10, (long)regs.r8,  (long)regs.r9);
+                    // set to invalid syscall
+                    if (ptrace(PTRACE_POKEUSER, pid, offsetof(struct user, regs.orig_rax), -1) != 0)
+                        err(EXIT_FAILURE, "failed to stop syscall from happening (set %%RAX to -1)");
+                }
+            }
+
+        } else if (
+            siginfo.si_status == SIGKILL ||
+            siginfo.si_status == SIGSEGV
+        ) { 
+            // killed child
+            unsigned long rip = ptrace(PTRACE_PEEKUSER, pid, offsetof(struct user, regs.rip), 0, 0);
+            fprintf(stderr, "%d killed at %p\n", pid, (void *)rip);
+            *th_p = th->next;
+            free(th);
+
+        } else {
+            errx(
+                EXIT_FAILURE,
+                "got unknown ptrace event (%d, %d) from thread %d",
+                siginfo.si_status >> 8,
+                siginfo.si_status & 0xff,
+                th->tid
+            );
+        }
 
         // resume execution
         if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1)
@@ -270,8 +384,10 @@ int main () {
     struct vm_t vm;
     vm.id = 0;
     vm.rfd = STDIN_FILENO;
+    vm.threads = NULL;
+    vm.next = NULL;
 
     do_cnew(&vm);
 
-    handle_syscalls();
+    handle_syscalls(&vm);
 }

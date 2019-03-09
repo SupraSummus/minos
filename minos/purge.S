@@ -8,10 +8,16 @@ purge:
 	// store first argument
 	movq %rdi, %r12
 
-	// unmap everything
+	// unmap before
 	movq $11, %rax  // sys_munmap
-	movq $PAGE_SIZE, %rdi  // start
-	movq $0x7fffffffe000, %rsi  // len
+	movq $0, %rdi  // start
+	movq $ENTRY_POINT, %rsi  // len
+	syscall
+
+	// unmap after
+	movq $11, %rax  // sys_munmap
+	movq $(PAGE_SIZE + ENTRY_POINT), %rdi  // start
+	movq $(MAX_ADDR - PAGE_SIZE - ENTRY_POINT), %rsi  // len
 	syscall
 
 	// unmap vsyscall -- this doesn't seem to work
