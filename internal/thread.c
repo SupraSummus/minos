@@ -24,12 +24,6 @@ void * thread_main(void * arg) {
 }
 
 int main(void) {
-	pthread_t thread;
-	if (pthread_create(&(thread), NULL, thread_main, (void *)3) != 0) {
-		err(EXIT_FAILURE, "failed to create thread");
-	}
-	if (pthread_join(thread, NULL) != 0) {
-		err(EXIT_FAILURE, "failed to join the thread");
-	}
+	thread_main((void *)3);
 	return EXIT_SUCCESS;
 }
