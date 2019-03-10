@@ -16,7 +16,7 @@ Communications between containers is asynchronous, via reliable, ordered byte st
 General, architecture independant syscalls
 ------------------------------------------
 
- * cnew(code_rfd, arch_spec...) -> cid
+ * cnew(code_rfd, rfds, rfd_count, wfds, wfd_count arch_spec...) -> cid
 
    Create new virtual memory space. Memory is filled with data written to wfd (begining at architecture-specific addr) and then executed.
 

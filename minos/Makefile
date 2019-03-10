@@ -4,7 +4,7 @@ LDFLAGS =
 
 all: minos
 
-minos: main.o purge.o
+minos: main.o purge.o thread.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 %.o: %.c
