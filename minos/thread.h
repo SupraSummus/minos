@@ -32,5 +32,6 @@ extern struct th_t * * th_and_c_get_by_tid(struct c_t * * *, pid_t pid);
 extern struct th_t * * th_get_by_tid(struct th_t * *, pid_t pid);
 extern void container_init(struct c_t *);
 extern void container_rm(struct c_t * *);
+extern void container_add(struct c_t * *, struct c_t *);
 
 #endif

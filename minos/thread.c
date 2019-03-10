@@ -52,3 +52,9 @@ void container_rm(struct c_t * * c_p) {
 	*c_p = c->next;
 	c->next = NULL;
 }
+
+void container_add(struct c_t * * c_p, struct c_t * c) {
+	assert(c->next == NULL);
+	c->next = *c_p;
+	*c_p = c;
+}

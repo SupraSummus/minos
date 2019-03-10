@@ -10,7 +10,7 @@ int main () {
 	write(output_fd, "parent\n", 7);
 
 	int cid = cnew(
-		code_fd,
+		3, //code_fd,
 		NULL, 0,
 		&output_fd, 1,
 		CNEW_X86_64_LINUX_LIKE
@@ -20,6 +20,6 @@ int main () {
 		return EXIT_FAILURE;
 	}
 
-	printf(/*output_fd,*/ "after\n");  // this will fail as we dont own the fd anymore
+	//printf(/*output_fd,*/ "after\n");  // this will fail as we dont own the fd anymore
 	return EXIT_SUCCESS;
 }

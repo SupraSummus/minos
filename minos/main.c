@@ -313,10 +313,14 @@ void handle_syscalls(struct c_t * * start_c_p) {
                         break;
 
                     case SYS_cnew:
-                        do_cnew(th_p, regs.rdi);
+                        (void)1; // local var declaration cant be first
+                        struct c_t * new_c = malloc(sizeof(struct c_t));
+                        if (new_c == NULL) err(EXIT_FAILURE, "malloc failed");
+                        container_init(new_c);
+                        container_add(start_c_p, new_c);
                         pass_syscall = false;
                         th->custom_syscall_result = true;
-                        th->syscall_result = -42;
+                        th->syscall_result = do_cnew(new_c, regs.rdi) ? 0 : -1;
                         break;
 
                     case SYS_write:
