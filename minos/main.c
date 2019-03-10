@@ -21,6 +21,7 @@
 
 #include "purge.h"
 #include "consts.h"
+#include "thread.h"
 
 
 static const bool DEBUG = false;
@@ -67,23 +68,6 @@ void * read_all(int fd, size_t * len, size_t * allocated) {
 }
 
 
-//struct vm_t {
-//    int id;
-//    int rfd;
-//    struct th_t * threads;
-//    struct vm_t * next;
-//};
-
-
-struct th_t {
-    pid_t tid;
-    bool in_syscall;
-    bool custom_syscall_result;
-    long syscall_result;
-    struct th_t * next;
-};
-
-
 bool set_ptrace_options(pid_t pid) {
     if (ptrace(
         PTRACE_SETOPTIONS, pid, 0,
@@ -97,7 +81,10 @@ bool set_ptrace_options(pid_t pid) {
 }
 
 
-bool do_cnew (struct th_t * * th_p, int rfd) {
+bool do_cnew (struct c_t * c, int rfd) {
+    assert(c->threads == NULL);
+    assert(c->thread_count == 0);
+
     // read program into local mem
     size_t program_size;
     size_t program_allocated;
@@ -194,15 +181,14 @@ bool do_cnew (struct th_t * * th_p, int rfd) {
         kill(pid, SIGKILL);
         return false;
     }
+    th_init(th);
     th->tid = pid;
-    th->in_syscall = false;
-    th->next = *th_p;
-    *th_p = th;
+    th_add(c, th);
 
     // resume execution
     if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1) {
         kill(pid, SIGKILL);
-        *th_p = th->next;
+        th_rm(&(c->threads));
         free(th);
         return false;
     }
@@ -211,11 +197,14 @@ bool do_cnew (struct th_t * * th_p, int rfd) {
 }
 
 
-void handle_syscalls(struct th_t * * start_th_p) {
-    int untraced = 0;  // number of threads spawned, but untraced yet
-    int thread_count = 1;  // just for debugging - it assumes current start_th_p list length
+void handle_syscalls(struct c_t * * start_c_p) {
+    int untraced_count = 0;  // number of threads spawned, but untraced yet
 
-    while (*start_th_p != NULL || untraced != 0) {
+    // container of threads not assigned to any container (because we didn't get PTRACE_EVENT_CLONE from their parent yet)
+    struct c_t unassigned_c;
+    container_init(&unassigned_c);
+
+    while (*start_c_p != NULL || untraced_count != 0) {
         siginfo_t siginfo;
 
         /* wait for next system call or exit from syscall */
@@ -224,56 +213,83 @@ void handle_syscalls(struct th_t * * start_th_p) {
 
         // get relevant thread
         pid_t pid = siginfo.si_pid;
-        struct th_t * * th_p = start_th_p;
-        while (*th_p != NULL && (*th_p)->tid != pid)
-            th_p = &((*th_p)->next);
-        struct th_t * th = *th_p;
+        struct c_t * * c_p = start_c_p;
+        struct th_t * * th_p = th_and_c_get_by_tid(&c_p, pid);
 
-        if (th == NULL) {
+        if (th_p == NULL) {
             // we dont know this thread - it's a new thread coming from clone()
-            untraced --;
+            untraced_count --;
 
             // add to thread list
             struct th_t * new_th = malloc(sizeof(struct th_t));
             if (new_th == NULL) err(EXIT_FAILURE, "malloc failed");
+            th_init(new_th);
+            th_add(&unassigned_c, new_th);
             new_th->tid = pid;
-            new_th->in_syscall = false;
-            new_th->next = th;
-            *th_p = new_th;
-            thread_count ++;
+            new_th->in_syscall = true;
 
-            if (DEBUG) fprintf(stderr, "%d is a new thread, untraced %d, traced %d\n", pid, untraced, thread_count);
+            if (DEBUG) fprintf(stderr, "%d is a new thread, untraced %d\n", pid, untraced_count);
+
+            // dont wake this thread up - first we need to catch parent exiting from clone() to know container scope
+            continue;
 
         } else if (siginfo.si_status == (SIGTRAP | (PTRACE_EVENT_CLONE << 8))) {
             // new thread observed from previous old thread
-            untraced ++;
-            if (DEBUG) fprintf(stderr, "%d PTRACE_EVENT_CLONE, untraced %d\n", pid, untraced);
+            untraced_count ++;
+            if (DEBUG) fprintf(stderr, "%d PTRACE_EVENT_CLONE, untraced %d\n", pid, untraced_count);
 
         } else if (siginfo.si_status == (SIGTRAP | (PTRACE_EVENT_EXIT << 8))) {
             // thread termination
-            *th_p = th->next;
+            struct th_t * th = *th_p;
+            th_rm(th_p);
             free(th);
-            thread_count --;
-            if (DEBUG) fprintf(stderr, "%d PTRACE_EVENT_EXIT, traced %d\n", pid, thread_count);
+            if ((*c_p)->threads == NULL) container_rm(c_p);
+            if (DEBUG) fprintf(stderr, "%d PTRACE_EVENT_EXIT\n", pid);
 
         } else if (siginfo.si_status == (SIGTRAP | 0x80)) {
             // PTRACE_O_TRACESYSGOOD stop
+            struct th_t * th = *th_p;
+
+            /* Gather system call arguments */
+            struct user_regs_struct regs;
+            if (ptrace(PTRACE_GETREGS, pid, 0, &regs) == -1)
+                err(EXIT_FAILURE, "failed to get child registers");
 
             if (th->in_syscall) {
                 // syscall exit
                 th->in_syscall = false;
+
                 if (th->custom_syscall_result) {
                     if (ptrace(PTRACE_POKEUSER, pid, offsetof(struct user, regs.rax), th->syscall_result) == -1)
                         err(EXIT_FAILURE, "failed to set custom syscall result");
                 }
+
+                // this is a return from clone() in parent thread
+                if (regs.orig_rax == SYS_clone && (long long)regs.rax > 0) {
+                    pid_t new_pid = regs.rax;
+                    struct c_t * container = th->container;
+                    th_p = th_get_by_tid(&(unassigned_c.threads), new_pid);
+                    if (*th_p == NULL) {
+                        untraced_count --;
+                        th = malloc(sizeof(struct th_t));
+                        if (th == NULL) err(EXIT_FAILURE, "malloc failed");
+                        th_init(th);
+                        th->tid = new_pid;
+                        th->in_syscall = true;
+                        th_add(container, th);
+                    } else {
+                        th = *th_p;
+                        th_rm(th_p);
+                        th_add(container, th);
+                        th->in_syscall = false;
+                        // resume execution
+                        if (ptrace(PTRACE_SYSCALL, new_pid, 0, 0) == -1)
+                            err(EXIT_FAILURE, "failed PTRACE_SYSCALL");
+                    }
+                }
             } else {
                 // syscall enter
                 th->in_syscall = true;
-
-                /* Gather system call arguments */
-                struct user_regs_struct regs;
-                if (ptrace(PTRACE_GETREGS, pid, 0, &regs) == -1)
-                    err(EXIT_FAILURE, "failed to get child registers");
                 long syscall = regs.orig_rax;
 
                 bool pass_syscall = false;
@@ -343,19 +359,25 @@ void handle_syscalls(struct th_t * * start_th_p) {
                 }
             }
 
+        } else if (siginfo.si_status == SIGSTOP) {
+            /* stopped process - possibly new thread coming out from clone() */
+            struct th_t * th = *th_p;
+            th->in_syscall = false;
         } else if (
             siginfo.si_status == SIGKILL ||
             siginfo.si_status == SIGSEGV
         ) { 
             // killed child
-            unsigned long rip = ptrace(PTRACE_PEEKUSER, pid, offsetof(struct user, regs.rip), 0, 0);
-            *th_p = th->next;
+            struct th_t * th = *th_p;
+            th_rm(th_p);
             free(th);
-            thread_count--;
+            if ((*c_p)->threads == NULL) container_rm(c_p);
 
-            fprintf(stderr, "%d killed at %p, traced %d\n", pid, (void *)rip, thread_count);
+            unsigned long long rip = ptrace(PTRACE_PEEKUSER, pid, offsetof(struct user, regs.rip), 0, 0);
+            fprintf(stderr, "%d killed at %p\n", pid, (void *)rip);
 
         } else {
+            struct th_t * th = *th_p;
             errx(
                 EXIT_FAILURE,
                 "got unknown ptrace event (%d, %d) from thread %d",
@@ -370,15 +392,16 @@ void handle_syscalls(struct th_t * * start_th_p) {
             err(EXIT_FAILURE, "failed PTRACE_SYSCALL");
     }
 
-    if (*start_th_p != NULL) warnx("exiting with notempty thread list");
-    if (untraced != 0) warnx("exiting with nonzero untraced threads count");
-    if (thread_count != 0) warnx("exiting with nonzero traced threads count");
+    if (*start_c_p != NULL) warnx("exiting with notempty container list");
+    if (untraced_count != 0) warnx("exiting with nonzero untraced threads count");
 }
 
 int main () {
-    struct th_t * th = NULL;
-    if (!do_cnew(&th, STDIN_FILENO))
+    struct c_t c;
+    container_init(&c);
+    if (!do_cnew(&(c), STDIN_FILENO))
         errx(EXIT_FAILURE, "failed to spawn initial container");
-    handle_syscalls(&th);
+    struct c_t * c_p = &c;
+    handle_syscalls(&c_p);
     return EXIT_SUCCESS;
 }
