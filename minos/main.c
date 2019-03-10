@@ -321,6 +321,7 @@ void handle_syscalls(struct th_t * * start_th_p) {
 
                     default:
                         pass_syscall = false;
+                        th->custom_syscall_result = false;
                         break;
                 }
 

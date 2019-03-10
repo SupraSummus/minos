@@ -1,5 +1,5 @@
 CC = cc
-CFLAGS = -Wall -Wextra -Imusl/include -Imusl/obj/include -Imusl/arch/x86_64 -I../include/
+CFLAGS = -Wall -Wextra -Imusl/include/ -Imusl/obj/include/ -Imusl/arch/generic/ -Imusl/arch/x86_64/ -I../include/
 LD = ld
 LDFLAGS = -static -nostdlib --section-start .init=0x10000
 CLDFLAGS = -e __setup_stack_and_start
