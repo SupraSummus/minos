@@ -2,7 +2,6 @@
 
 #include <assert.h>
 #include <err.h>
-#include <errno.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -12,12 +11,13 @@
 #include <syscall.h>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
-#include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sched.h>
+
+#include <minos.h>
 
 #include "purge.h"
 #include "consts.h"
@@ -278,24 +278,21 @@ void handle_syscalls(struct vm_t * vm) {
                 switch (syscall) {
                     case SYS_mmap:
                         // pass only when fd is -1 (we want to prevent real file maps)
-                        word = ptrace(
-                            PTRACE_PEEKUSER, pid,
-                            offsetof(struct user, regs.r8), NULL
-                        );
-                        pass_syscall = (word == -1);
+                        pass_syscall = ((long)regs.r8 == -1);
                         break;
 
                     case SYS_clone:
                         // check if flags are correct
-                        word = ptrace(
-                            PTRACE_PEEKUSER, pid,
-                            offsetof(struct user, regs.rdi), NULL
-                        );
+                        word = regs.rdi;
                         pass_syscall = (
                             (word & CLONE_FILES) &&
                             !(word & CLONE_VFORK) &&
                             (word & CLONE_VM)
                         );
+                        break;
+
+                    case SYS_cnew:
+                        pass_syscall = false;
                         break;
 
                     case SYS_write:
