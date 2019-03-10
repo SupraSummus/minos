@@ -67,17 +67,19 @@ void * read_all(int fd, size_t * len, size_t * allocated) {
 }
 
 
-struct vm_t {
-    int id;
-    int rfd;
-    struct th_t * threads;
-    struct vm_t * next;
-};
+//struct vm_t {
+//    int id;
+//    int rfd;
+//    struct th_t * threads;
+//    struct vm_t * next;
+//};
 
 
 struct th_t {
     pid_t tid;
     bool in_syscall;
+    bool custom_syscall_result;
+    long syscall_result;
     struct th_t * next;
 };
 
@@ -95,19 +97,16 @@ bool set_ptrace_options(pid_t pid) {
 }
 
 
-bool do_cnew (struct vm_t * vm) {
-    assert(vm->threads == NULL);
-
+bool do_cnew (struct th_t * * th_p, int rfd) {
     // read program into local mem
     size_t program_size;
     size_t program_allocated;
-    void * program = read_all(vm->rfd, &program_size, &program_allocated);
+    void * program = read_all(rfd, &program_size, &program_allocated);
     if (program == NULL) {
         warn("reading program code failed");
         return false;
     }
-    close(vm->rfd);
-    vm->rfd = -1;
+    close(rfd);
     program_size = (program_size / PAGE_SIZE + 1) * PAGE_SIZE;  // TODO better rounding
     if (DEBUG) fprintf(stderr, "program loaded locally at %p, len %zu\n", program, program_size);
 
@@ -197,26 +196,26 @@ bool do_cnew (struct vm_t * vm) {
     }
     th->tid = pid;
     th->in_syscall = false;
-    th->next = vm->threads;
-    vm->threads = th;
+    th->next = *th_p;
+    *th_p = th;
 
     // resume execution
     if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1) {
         kill(pid, SIGKILL);
-        vm->threads = th->next;
+        *th_p = th->next;
         free(th);
         return false;
     }
 
-    return 0;
+    return true;
 }
 
 
-void handle_syscalls(struct vm_t * vm) {
+void handle_syscalls(struct th_t * * start_th_p) {
     int untraced = 0;  // number of threads spawned, but untraced yet
-    int thread_count = 1;  // just for debugging
+    int thread_count = 1;  // just for debugging - it assumes current start_th_p list length
 
-    while (vm->threads != NULL || untraced != 0) {
+    while (*start_th_p != NULL || untraced != 0) {
         siginfo_t siginfo;
 
         /* wait for next system call or exit from syscall */
@@ -225,7 +224,7 @@ void handle_syscalls(struct vm_t * vm) {
 
         // get relevant thread
         pid_t pid = siginfo.si_pid;
-        struct th_t * * th_p = &(vm->threads);
+        struct th_t * * th_p = start_th_p;
         while (*th_p != NULL && (*th_p)->tid != pid)
             th_p = &((*th_p)->next);
         struct th_t * th = *th_p;
@@ -263,6 +262,10 @@ void handle_syscalls(struct vm_t * vm) {
             if (th->in_syscall) {
                 // syscall exit
                 th->in_syscall = false;
+                if (th->custom_syscall_result) {
+                    if (ptrace(PTRACE_POKEUSER, pid, offsetof(struct user, regs.rax), th->syscall_result) == -1)
+                        err(EXIT_FAILURE, "failed to set custom syscall result");
+                }
             } else {
                 // syscall enter
                 th->in_syscall = true;
@@ -279,6 +282,7 @@ void handle_syscalls(struct vm_t * vm) {
                     case SYS_mmap:
                         // pass only when fd is -1 (we want to prevent real file maps)
                         pass_syscall = ((long)regs.r8 == -1);
+                        th->custom_syscall_result = false;
                         break;
 
                     case SYS_clone:
@@ -289,10 +293,14 @@ void handle_syscalls(struct vm_t * vm) {
                             !(word & CLONE_VFORK) &&
                             (word & CLONE_VM)
                         );
+                        th->custom_syscall_result = false;
                         break;
 
                     case SYS_cnew:
+                        do_cnew(th_p, regs.rdi);
                         pass_syscall = false;
+                        th->custom_syscall_result = true;
+                        th->syscall_result = -42;
                         break;
 
                     case SYS_write:
@@ -308,6 +316,7 @@ void handle_syscalls(struct vm_t * vm) {
                     case SYS_arch_prctl:
                     case SYS_futex:
                         pass_syscall = true;
+                        th->custom_syscall_result = false;
                         break;
 
                     default:
@@ -360,19 +369,15 @@ void handle_syscalls(struct vm_t * vm) {
             err(EXIT_FAILURE, "failed PTRACE_SYSCALL");
     }
 
-    if (vm->threads != NULL) warnx("exiting with notempty thread list");
+    if (*start_th_p != NULL) warnx("exiting with notempty thread list");
     if (untraced != 0) warnx("exiting with nonzero untraced threads count");
     if (thread_count != 0) warnx("exiting with nonzero traced threads count");
 }
 
 int main () {
-    struct vm_t vm;
-    vm.id = 0;
-    vm.rfd = STDIN_FILENO;
-    vm.threads = NULL;
-    vm.next = NULL;
-
-    do_cnew(&vm);
-    handle_syscalls(&vm);
+    struct th_t * th = NULL;
+    if (!do_cnew(&th, STDIN_FILENO))
+        errx(EXIT_FAILURE, "failed to spawn initial container");
+    handle_syscalls(&th);
     return EXIT_SUCCESS;
 }
