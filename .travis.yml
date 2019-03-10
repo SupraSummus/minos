@@ -1,5 +1,5 @@
 language: c
 install:
- - pushd internal/musl && ./configure && make -j && popd
+ - pushd musl && ./configure && make -j && popd
 script:
  - make test

@@ -1,3 +1,3 @@
-[submodule "internal/musl"]
-	path = internal/musl
+[submodule "musl"]
+	path = musl
 	url = https://github.com/SupraSummus/musl.git

@@ -1,13 +1,15 @@
 all:
-	make -C minos all
-	make -C internal all
+	$(MAKE) -C musl all
+	$(MAKE) -C minos all
+	$(MAKE) -C programs all
 
 clean:
-	make -C minos clean
-	make -C internal clean
+	$(MAKE) -C musl clean
+	$(MAKE) -C minos clean
+	$(MAKE) -C programs clean
 
 test: all
-	cat internal/hello.asm.bin | minos/minos | ./stdin-eq 'hello world\n'
-	cat internal/hello.c.bin | minos/minos | ./stdin-eq 'hello world\n'
-	cat internal/thread.c.bin | minos/minos | sort | ./stdin-eq '0\n0\n0\n0\n0\n0\n0\n0\n1\n1\n1\n1\n2\n2\n3\n'
-	cat internal/cnew.c.bin | minos/minos
+	cat programs/hello.asm.bin | minos/minos | ./stdin-eq 'hello world\n'
+	cat programs/hello.c.bin | minos/minos | ./stdin-eq 'hello world\n'
+	cat programs/thread.c.bin | minos/minos | sort | ./stdin-eq '0\n0\n0\n0\n0\n0\n0\n0\n1\n1\n1\n1\n2\n2\n3\n'
+	cat programs/cnew.c.bin | minos/minos
