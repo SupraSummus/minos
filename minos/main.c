@@ -17,6 +17,8 @@
 #include <unistd.h>
 #include <sched.h>
 #include <errno.h>
+#include <utlist.h>
+
 
 #include <minos.h>
 
@@ -82,7 +84,7 @@ bool set_ptrace_options (pid_t pid) {
 }
 
 
-bool do_cnew (struct c_t * c, int rfd) {
+bool do_cnew (struct c_t * c, int rfd, struct th_t * * threads) {
     assert(c->threads == NULL);
     assert(c->thread_count == 0);
 
@@ -188,12 +190,15 @@ bool do_cnew (struct c_t * c, int rfd) {
     }
     th_init(th);
     th->tid = pid;
-    th_add(c, th);
+    th->container = c;
+    DL_APPEND(c->threads, th);
+    HASH_ADD_INT(*threads, tid, th);
 
     // resume execution
     if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1) {
         kill(pid, SIGKILL);
-        th_rm(&(c->threads));
+        DL_DELETE(c->threads, th);
+        HASH_DEL(*threads, th);
         free(th);
         return false;
     }
@@ -202,14 +207,13 @@ bool do_cnew (struct c_t * c, int rfd) {
 }
 
 
-void handle_syscalls(struct c_t * * start_c_p) {
+void handle_syscalls(struct th_t * * threads_p) {
     int untraced_count = 0;  // number of threads spawned, but untraced yet
 
-    // container of threads not assigned to any container (because we didn't catch their parent exiting clone() yet)
-    struct c_t unassigned_c;
-    container_init(&unassigned_c);
+    // collection of threads not assigned to any container (because we didn't catch their parent exiting clone() yet)
+    struct th_t * unassigned = NULL;
 
-    while (*start_c_p != NULL || untraced_count != 0) {
+    while (*threads_p != NULL || untraced_count != 0) {
         siginfo_t siginfo;
 
         /* wait for next system call or exit from syscall */
@@ -218,10 +222,10 @@ void handle_syscalls(struct c_t * * start_c_p) {
 
         // get relevant thread
         pid_t pid = siginfo.si_pid;
-        struct c_t * * c_p = start_c_p;
-        struct th_t * * th_p = th_and_c_get_by_tid(&c_p, pid);
+        struct th_t * thread;
+        HASH_FIND_INT(*threads_p, &pid, thread);
 
-        if (th_p == NULL) {
+        if (thread == NULL) {
             // we dont know this thread - it's a new thread coming from clone()
             untraced_count --;
 
@@ -229,9 +233,9 @@ void handle_syscalls(struct c_t * * start_c_p) {
             struct th_t * new_th = malloc(sizeof(struct th_t));
             if (new_th == NULL) err(EXIT_FAILURE, "malloc failed");
             th_init(new_th);
-            th_add(&unassigned_c, new_th);
             new_th->tid = pid;
             new_th->in_syscall = true;
+            HASH_ADD_INT(unassigned, tid, new_th);
 
             if (DEBUG) fprintf(stderr, "%d is a new thread, untraced %d\n", pid, untraced_count);
 
@@ -243,50 +247,59 @@ void handle_syscalls(struct c_t * * start_c_p) {
             untraced_count ++;
             if (DEBUG) fprintf(stderr, "%d PTRACE_EVENT_CLONE, untraced %d\n", pid, untraced_count);
 
-        } else if (siginfo.si_status == (SIGTRAP | (PTRACE_EVENT_EXIT << 8))) {
+        } else if (
+            siginfo.si_status == (SIGTRAP | (PTRACE_EVENT_EXIT << 8)) ||
+            siginfo.si_status == SIGKILL ||
+            siginfo.si_status == SIGSEGV
+        ) {
             // thread termination
-            struct th_t * th = *th_p;
-            th_rm(th_p);
-            free(th);
-            if ((*c_p)->threads == NULL) container_rm(c_p);
-            if (DEBUG) fprintf(stderr, "%d PTRACE_EVENT_EXIT\n", pid);
+            DL_DELETE(thread->container->threads, thread);
+            HASH_DEL(*threads_p, thread);
+            if (thread->container->threads == NULL) {
+                free(thread->container);
+            }
+            free(thread);
+
+            if (DEBUG) fprintf(stderr, "%d exiting, remaining %d threads\n", pid, HASH_COUNT(*threads_p));
 
         } else if (siginfo.si_status == (SIGTRAP | 0x80)) {
             // PTRACE_O_TRACESYSGOOD stop
-            struct th_t * th = *th_p;
 
             /* Gather system call arguments */
             struct user_regs_struct regs;
             if (ptrace(PTRACE_GETREGS, pid, 0, &regs) == -1)
                 err(EXIT_FAILURE, "failed to get child registers");
 
-            if (th->in_syscall) {
+            if (thread->in_syscall) {
                 // syscall exit
-                th->in_syscall = false;
+                thread->in_syscall = false;
 
-                if (th->custom_syscall_result) {
-                    if (ptrace(PTRACE_POKEUSER, pid, offsetof(struct user, regs.rax), th->syscall_result) == -1)
+                if (thread->custom_syscall_result) {
+                    if (ptrace(PTRACE_POKEUSER, pid, offsetof(struct user, regs.rax), thread->syscall_result) == -1)
                         err(EXIT_FAILURE, "failed to set custom syscall result");
                 }
 
                 // this is a return from clone() in parent thread
                 if (regs.orig_rax == SYS_clone && (long long)regs.rax > 0) {
                     pid_t new_pid = regs.rax;
-                    struct c_t * container = th->container;
-                    th_p = th_get_by_tid(&(unassigned_c.threads), new_pid);
-                    if (*th_p == NULL) {
+                    struct th_t * new_thread;
+                    HASH_FIND_INT(unassigned, &new_pid, new_thread);
+                    if (new_thread == NULL) {
                         untraced_count --;
-                        th = malloc(sizeof(struct th_t));
-                        if (th == NULL) err(EXIT_FAILURE, "malloc failed");
-                        th_init(th);
-                        th->tid = new_pid;
-                        th->in_syscall = true;
-                        th_add(container, th);
+                        new_thread = malloc(sizeof(struct th_t));
+                        if (new_thread == NULL) err(EXIT_FAILURE, "malloc failed");
+                        th_init(new_thread);
+                        new_thread->tid = new_pid;
+                        new_thread->in_syscall = true;
+                        new_thread->container = thread->container;
+                        DL_APPEND(thread->container->threads, new_thread);
+                        HASH_ADD_INT(*threads_p, tid, new_thread);
                     } else {
-                        th = *th_p;
-                        th_rm(th_p);
-                        th_add(container, th);
-                        th->in_syscall = false;
+                        HASH_DEL(unassigned, new_thread);
+                        HASH_ADD_INT(*threads_p, tid, new_thread);
+                        DL_APPEND(thread->container->threads, new_thread);
+                        new_thread->container = thread->container;
+                        new_thread->in_syscall = false;
                         // resume execution of child thread
                         if (ptrace(PTRACE_SYSCALL, new_pid, 0, 0) == -1)
                             err(EXIT_FAILURE, "failed PTRACE_SYSCALL");
@@ -294,7 +307,7 @@ void handle_syscalls(struct c_t * * start_c_p) {
                 }
             } else {
                 // syscall enter
-                th->in_syscall = true;
+                thread->in_syscall = true;
                 long syscall = regs.orig_rax;
 
                 bool pass_syscall = false;
@@ -303,7 +316,7 @@ void handle_syscalls(struct c_t * * start_c_p) {
                     case SYS_mmap:
                         // pass only when fd is -1 (we want to prevent real file maps)
                         pass_syscall = ((long)regs.r8 == -1);
-                        th->custom_syscall_result = false;
+                        thread->custom_syscall_result = false;
                         break;
 
                     case SYS_clone:
@@ -314,7 +327,7 @@ void handle_syscalls(struct c_t * * start_c_p) {
                             !(word & CLONE_VFORK) &&
                             (word & CLONE_VM)
                         );
-                        th->custom_syscall_result = false;
+                        thread->custom_syscall_result = false;
                         break;
 
                     case SYS_cnew:
@@ -323,22 +336,21 @@ void handle_syscalls(struct c_t * * start_c_p) {
                         if (new_c == NULL) err(EXIT_FAILURE, "malloc failed");
                         container_init(new_c);
                         pass_syscall = false;
-                        th->custom_syscall_result = true;
+                        thread->custom_syscall_result = true;
 
                         int inner_fd = regs.rdi;
                         struct fd_t * fd; 
-                        HASH_FIND_INT((*c_p)->rfds, &inner_fd, fd);
+                        HASH_FIND_INT(thread->container->rfds, &inner_fd, fd);
                         if (fd == NULL) {
-                            th->syscall_result = -EBADF;
+                            thread->syscall_result = -EBADF;
                         } else {
-                            bool result = do_cnew(new_c, fd->fd);
+                            bool result = do_cnew(new_c, fd->fd, threads_p);
                             if (result) {
-                                th->syscall_result = 0;
-                                HASH_DEL((*c_p)->rfds, fd);
+                                thread->syscall_result = 0;
+                                HASH_DEL(thread->container->rfds, fd);
                                 free(fd);
-                                container_add(start_c_p, new_c);
                             } else {
-                                th->syscall_result = -1;
+                                thread->syscall_result = -1;
                                 free(new_c);
                             }
                         }
@@ -357,12 +369,12 @@ void handle_syscalls(struct c_t * * start_c_p) {
                     case SYS_arch_prctl:
                     case SYS_futex:
                         pass_syscall = true;
-                        th->custom_syscall_result = false;
+                        thread->custom_syscall_result = false;
                         break;
 
                     default:
                         pass_syscall = false;
-                        th->custom_syscall_result = false;
+                        thread->custom_syscall_result = false;
                         break;
                 }
 
@@ -386,29 +398,15 @@ void handle_syscalls(struct c_t * * start_c_p) {
 
         } else if (siginfo.si_status == SIGSTOP) {
             /* stopped process - possibly new thread coming out from clone() */
-            struct th_t * th = *th_p;
-            th->in_syscall = false;
-        } else if (
-            siginfo.si_status == SIGKILL ||
-            siginfo.si_status == SIGSEGV
-        ) { 
-            // killed child
-            struct th_t * th = *th_p;
-            th_rm(th_p);
-            free(th);
-            if ((*c_p)->threads == NULL) container_rm(c_p);
-
-            unsigned long long rip = ptrace(PTRACE_PEEKUSER, pid, offsetof(struct user, regs.rip), 0, 0);
-            fprintf(stderr, "%d killed at %p\n", pid, (void *)rip);
+            thread->in_syscall = false;
 
         } else {
-            struct th_t * th = *th_p;
             errx(
                 EXIT_FAILURE,
                 "got unknown ptrace event (%d, %d) from thread %d",
                 siginfo.si_status >> 8,
                 siginfo.si_status & 0xff,
-                th->tid
+                thread->tid
             );
         }
 
@@ -417,9 +415,9 @@ void handle_syscalls(struct c_t * * start_c_p) {
             err(EXIT_FAILURE, "failed PTRACE_SYSCALL");
     }
 
-    if (*start_c_p != NULL) warnx("exiting with notempty container list");
+    if (*threads_p != NULL) warnx("exiting with notempty thread list");
     if (untraced_count != 0) warnx("exiting with nonzero untraced threads count");
-    if (unassigned_c.thread_count != 0) warnx("exiting with nonzero unassigned threads count");
+    if (unassigned != NULL) warnx("exiting with nonzero unassigned threads count");
 }
 
 bool parse_fds(char * str, struct fd_t * * fds) {
@@ -467,31 +465,25 @@ int main (int argc, char * * argv) {
 
     char * end;
     int code_fd = strtol(argv[1], &end, 0);
-    if (*end != '\0') err(EXIT_FAILURE, "failed to parse code fd");
+    if (*end != '\0') errx(EXIT_FAILURE, "failed to parse code fd");
 
-    struct c_t c;
-    container_init(&c);
+    struct c_t * container = malloc(sizeof(struct c_t));
+    if (container == NULL) err(EXIT_FAILURE, "malloc failed");
+    container_init(container);
 
-    if (!parse_fds(argv[2], &(c.rfds))) {
-        err(EXIT_FAILURE, "failed to parse rfds");
+    if (!parse_fds(argv[2], &(container->rfds))) {
+        errx(EXIT_FAILURE, "failed to parse rfds");
         
     }
-    if (!parse_fds(argv[3], &(c.wfds))) {
-        err(EXIT_FAILURE, "failed to parse wfds");
+    if (!parse_fds(argv[3], &(container->wfds))) {
+        errx(EXIT_FAILURE, "failed to parse wfds");
     }
 
-    /*
-    for(struct fd_t * fd = c.rfds; fd != NULL; fd = fd->hh.next) {
-        fprintf(stderr, "fd %d -> inner %d\n", fd->fd, fd->inner);
-    }
-    for(struct fd_t * fd = c.wfds; fd != NULL; fd = fd->hh.next) {
-        fprintf(stderr, "inner %d -> fd %d\n", fd->inner, fd->fd);
-    }
-    */
+    struct th_t * threads = NULL;
 
-    if (!do_cnew(&c, code_fd))
+    if (!do_cnew(container, code_fd, &threads))
         errx(EXIT_FAILURE, "failed to spawn initial container");
-    struct c_t * c_p = &c;
-    handle_syscalls(&c_p);
+
+    handle_syscalls(&threads);
     return EXIT_SUCCESS;
 }
