@@ -69,7 +69,7 @@ void * read_all(int fd, size_t * len, size_t * allocated) {
 }
 
 
-bool set_ptrace_options(pid_t pid) {
+bool set_ptrace_options (pid_t pid) {
     if (ptrace(
         PTRACE_SETOPTIONS, pid, 0,
         PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXIT

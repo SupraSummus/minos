@@ -15,24 +15,24 @@ struct c_t {
 
 
 struct fd_t {
-    int inner;  // fd number observed from inside a container
-    int fd;
+	int inner;  // fd number observed from inside a container
+	int fd;
 
-    /* makes this structure hashable */
-    UT_hash_handle hh;
+	/* makes this structure hashable */
+	UT_hash_handle hh;
 };
 
 
 struct th_t {
-    pid_t tid;
+	pid_t tid;
 
-    bool in_syscall;
-    bool custom_syscall_result;
-    long syscall_result;
+	bool in_syscall;
+	bool custom_syscall_result;
+	long syscall_result;
 
 	// container thread list
 	struct c_t * container;
-    struct th_t * next;
+	struct th_t * next;
 };
 
 
