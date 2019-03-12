@@ -13,8 +13,7 @@ Minos specifies simple API for spawning controlably interconnected computational
 
 Communications between containers is asynchronous, via reliable, ordered byte streams, like TCP or UNIX pipe, but minos abstracts that by use of file descriptors. Descriptors are of two types: write-only or read-only. Descriptors can be passed between containers, but single descriptor can be used in at most one container at a time.
 
-General, architecture independant syscalls
-------------------------------------------
+### General, architecture independant syscalls
 
  * cnew(code_rfd, rfds, rfd_count, wfds, wfd_count arch_spec...) -> cid
 
@@ -39,20 +38,28 @@ General, architecture independant syscalls
 
    Pass descriptor to child space. Descripor there will be visible under new id. Descriptor becomes unaccesible in calling container.
 
-Architecture specific container state
--------------------------------------
+### Architecture specific container state
 
  * arch_prctl - for example for setting FS, GS register
 
-Paged memory management
------------------------
+### Paged memory management
 
  * linux-like mmap/mremap/munmap/mprotect
 
    mmap is for anonymous-only pages
 
-Threads
--------
+### Threads
 
  * clone/exit/gettid/...
  * linux-like futex
+
+Building and testing
+--------------------
+
+You need to have [uthash](http://troydhanson.github.io/uthash/) header accessible in include dir. Under archlinux it can be installed from offcial repositories.
+
+To execute tests you need [pgspawn](https://github.com/SupraSummus/pgspawn).
+
+    cd musl; ./configure; cd ..   # configure musl - this has to be done only once
+    make -j                       # -j option means "do jobs in parallel"
+    make test

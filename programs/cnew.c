@@ -10,7 +10,7 @@ int main () {
 	write(output_fd, "parent\n", 7);
 
 	int cid = cnew(
-		3, //code_fd,
+		code_fd,
 		NULL, 0,
 		&output_fd, 1,
 		CNEW_X86_64_LINUX_LIKE

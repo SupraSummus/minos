@@ -9,7 +9,7 @@ clean:
 	$(MAKE) -C programs clean
 
 test: all
-	cat programs/hello.asm.bin | minos/minos | ./stdin-eq 'hello world\n'
-	cat programs/hello.c.bin | minos/minos | ./stdin-eq 'hello world\n'
-	cat programs/thread.c.bin | minos/minos | sort | ./stdin-eq '0\n0\n0\n0\n0\n0\n0\n0\n1\n1\n1\n1\n2\n2\n3\n'
+	cat programs/hello.asm.bin | minos/minos 0 - -,1 | ./stdin-eq 'hello world\n'
+	cat programs/hello.c.bin | minos/minos 0 - -,1 | ./stdin-eq 'hello world\n'
+	cat programs/thread.c.bin | minos/minos 0 - -,1 | sort | ./stdin-eq '0\n0\n0\n0\n0\n0\n0\n0\n1\n1\n1\n1\n2\n2\n3\n'
 	test/cnew

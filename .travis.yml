@@ -1,7 +1,7 @@
 dist: xenial
 language: c
 before_install:
- - sudo apt-get install python3-pip python3-setuptools
+ - sudo apt-get install python3-pip python3-setuptools uthash
 install:
  - pip3 install pgspawn
  - pushd musl && ./configure && make -j && popd

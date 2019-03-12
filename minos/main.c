@@ -16,6 +16,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sched.h>
+#include <errno.h>
 
 #include <minos.h>
 
@@ -98,7 +99,11 @@ bool do_cnew (struct c_t * c, int rfd) {
     if (DEBUG) fprintf(stderr, "program loaded locally at %p, len %zu\n", program, program_size);
 
     // make child
-    pid_t pid = fork();
+    pid_t pid = syscall(
+        SYS_clone,
+        CLONE_FILES | SIGCHLD,
+        0, 0, 0
+    );
     if (pid < 0) {
         warn("initial fork failed");
         munmap(program, program_allocated);
@@ -200,7 +205,7 @@ bool do_cnew (struct c_t * c, int rfd) {
 void handle_syscalls(struct c_t * * start_c_p) {
     int untraced_count = 0;  // number of threads spawned, but untraced yet
 
-    // container of threads not assigned to any container (because we didn't get PTRACE_EVENT_CLONE from their parent yet)
+    // container of threads not assigned to any container (because we didn't catch their parent exiting clone() yet)
     struct c_t unassigned_c;
     container_init(&unassigned_c);
 
@@ -282,7 +287,7 @@ void handle_syscalls(struct c_t * * start_c_p) {
                         th_rm(th_p);
                         th_add(container, th);
                         th->in_syscall = false;
-                        // resume execution
+                        // resume execution of child thread
                         if (ptrace(PTRACE_SYSCALL, new_pid, 0, 0) == -1)
                             err(EXIT_FAILURE, "failed PTRACE_SYSCALL");
                     }
@@ -317,10 +322,26 @@ void handle_syscalls(struct c_t * * start_c_p) {
                         struct c_t * new_c = malloc(sizeof(struct c_t));
                         if (new_c == NULL) err(EXIT_FAILURE, "malloc failed");
                         container_init(new_c);
-                        container_add(start_c_p, new_c);
                         pass_syscall = false;
                         th->custom_syscall_result = true;
-                        th->syscall_result = do_cnew(new_c, regs.rdi) ? 0 : -1;
+
+                        int inner_fd = regs.rdi;
+                        struct fd_t * fd; 
+                        HASH_FIND_INT((*c_p)->rfds, &inner_fd, fd);
+                        if (fd == NULL) {
+                            th->syscall_result = -EBADF;
+                        } else {
+                            bool result = do_cnew(new_c, fd->fd);
+                            if (result) {
+                                th->syscall_result = 0;
+                                HASH_DEL((*c_p)->rfds, fd);
+                                free(fd);
+                                container_add(start_c_p, new_c);
+                            } else {
+                                th->syscall_result = -1;
+                                free(new_c);
+                            }
+                        }
                         break;
 
                     case SYS_write:
@@ -398,12 +419,77 @@ void handle_syscalls(struct c_t * * start_c_p) {
 
     if (*start_c_p != NULL) warnx("exiting with notempty container list");
     if (untraced_count != 0) warnx("exiting with nonzero untraced threads count");
+    if (unassigned_c.thread_count != 0) warnx("exiting with nonzero unassigned threads count");
 }
 
-int main () {
+bool parse_fds(char * str, struct fd_t * * fds) {
+    assert(HASH_COUNT(*fds) == 0);
+
+    char * end;
+    int i = 0;
+    while (true) {
+        // parse fd info
+        long fd = strtol(str, &end, 0);
+        if (end == str) {
+            if (*end == '-') {
+                fd = -1;
+                end++;
+            } else {
+                warnx("unexpected character '%c'", *str);
+                // TODO free fds stored up to this point
+                return false;
+            }
+        }
+
+        // store in hashmap
+        struct fd_t * fd_s = malloc(sizeof(struct fd_t));
+        if (fd_s == NULL) err(EXIT_FAILURE, "malloc failed");
+        fd_s->inner = i;
+        fd_s->fd = fd;
+        HASH_ADD_INT(*fds, inner, fd_s);
+
+        // advance to next number
+        i++;
+        str = end;
+        if (*str == ',') {
+            str++;
+        } else if (*str == '\0') {
+            return true;
+        }
+    }
+}
+
+int main (int argc, char * * argv) {
+    if (argc != 4) {
+        fprintf(stderr, "usage: %s CODE_RFD RFD0,.. WFD0,..\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    char * end;
+    int code_fd = strtol(argv[1], &end, 0);
+    if (*end != '\0') err(EXIT_FAILURE, "failed to parse code fd");
+
     struct c_t c;
     container_init(&c);
-    if (!do_cnew(&(c), STDIN_FILENO))
+
+    if (!parse_fds(argv[2], &(c.rfds))) {
+        err(EXIT_FAILURE, "failed to parse rfds");
+        
+    }
+    if (!parse_fds(argv[3], &(c.wfds))) {
+        err(EXIT_FAILURE, "failed to parse wfds");
+    }
+
+    /*
+    for(struct fd_t * fd = c.rfds; fd != NULL; fd = fd->hh.next) {
+        fprintf(stderr, "fd %d -> inner %d\n", fd->fd, fd->inner);
+    }
+    for(struct fd_t * fd = c.wfds; fd != NULL; fd = fd->hh.next) {
+        fprintf(stderr, "inner %d -> fd %d\n", fd->inner, fd->fd);
+    }
+    */
+
+    if (!do_cnew(&c, code_fd))
         errx(EXIT_FAILURE, "failed to spawn initial container");
     struct c_t * c_p = &c;
     handle_syscalls(&c_p);

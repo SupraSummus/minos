@@ -3,12 +3,23 @@
 
 #include <stdbool.h>
 #include <sys/types.h>
+#include <uthash.h>
 
 struct c_t {
 	int thread_count;
-	int untraced_count;
 	struct th_t * threads;
 	struct c_t * next;
+	struct fd_t * rfds;
+	struct fd_t * wfds;
+};
+
+
+struct fd_t {
+    int inner;  // fd number observed from inside a container
+    int fd;
+
+    /* makes this structure hashable */
+    UT_hash_handle hh;
 };
 
 
