@@ -8,8 +8,9 @@
 
 extern int cnew (
 	int code_fd,
-	int * rfds, unsigned int rfd_count,
-	int * wfds, unsigned int wfd_count,
+	int * fds,
+	unsigned int rfd_count,
+	unsigned int wfd_count,
 	int arch_spec
 );
 

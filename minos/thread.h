@@ -38,6 +38,7 @@ struct th_t {
 	UT_hash_handle hh;
 };
 
+extern int get_external_fd(struct fd_t * fds, int internal);
 
 extern void th_init(struct th_t *);
 extern void container_init(struct c_t *);

@@ -26,6 +26,7 @@
 #include "consts.h"
 #include "thread.h"
 
+#define MAX_CNEW_FDS (128)
 
 static const bool DEBUG = false;
 
@@ -219,12 +220,12 @@ void handle_syscall_enter (struct th_t * thread, struct th_t * * threads_p) {
     long syscall = regs.orig_rax;
 
     bool pass_syscall = false;
+    thread->custom_syscall_result = false;
     int64_t word;
     switch (syscall) {
         case SYS_mmap:
             // pass only when fd is -1 (we want to prevent real file maps)
             pass_syscall = ((long)regs.r8 == -1);
-            thread->custom_syscall_result = false;
             break;
 
         case SYS_clone:
@@ -235,37 +236,101 @@ void handle_syscall_enter (struct th_t * thread, struct th_t * * threads_p) {
                 !(word & CLONE_VFORK) &&
                 (word & CLONE_VM)
             );
-            thread->custom_syscall_result = false;
             break;
 
         case SYS_cnew:
-            (void)1; // local var declaration cant be first
+            (void)1; // decl cannot be first
+            // verify counts
+            long rfd_count = regs.rdx;
+            long wfd_count = regs.r10;
+            if ((rfd_count + wfd_count) > MAX_CNEW_FDS) break;
+
+            // copy fd data
+            int fds[MAX_CNEW_FDS];
+            int * rfds = fds;
+            int * wfds = fds + rfd_count;
+            struct iovec local_io;
+            local_io.iov_base = fds;
+            local_io.iov_len = sizeof(int) * (rfd_count + wfd_count);
+            struct iovec remote_io;
+            remote_io.iov_base = (void *)regs.rsi;
+            remote_io.iov_len = sizeof(int) * (rfd_count + wfd_count);
+            if (process_vm_readv(
+                thread->tid,
+                &local_io, 1,
+                &remote_io, 1,
+                0
+            ) != (ssize_t)sizeof(int) * (rfd_count + wfd_count)) break;
+
+            // create new container
             struct c_t * new_c = malloc(sizeof(struct c_t));
             if (new_c == NULL) err(EXIT_FAILURE, "malloc failed");
             container_init(new_c);
+
+            // verify fds are valid
+            struct fd_t * fd;
+            for (int i = 0; i < rfd_count; i ++) {
+                if (rfds[i] == -1) continue;
+                HASH_FIND_INT(thread->container->rfds, &(rfds[i]), fd);
+                if (fd == NULL) goto undo_move_fds;
+                HASH_DEL(thread->container->rfds, fd);
+                fd->inner = i;
+                HASH_ADD_INT(new_c->rfds, inner, fd);
+            }
+            for (int i = 0; i < wfd_count; i ++) {
+                if (wfds[i] == -1) continue;
+                HASH_FIND_INT(thread->container->wfds, &(wfds[i]), fd);
+                if (fd == NULL) goto undo_move_fds;
+                HASH_DEL(thread->container->wfds, fd);
+                fd->inner = i;
+                HASH_ADD_INT(new_c->wfds, inner, fd);
+            }
+            HASH_FIND_INT(thread->container->rfds, &(regs.rdi), fd);
+            if (fd == NULL) goto undo_move_fds;
+            int code_fd = fd->fd;
+            HASH_DEL(thread->container->rfds, fd);
+            free(fd);
+
+            if (false) {
+                undo_move_fds:
+                fprintf(stderr, "TODO undo_move_fds\n");
+                free(new_c);
+                break;
+            }
+
+            bool result = do_cnew(new_c, code_fd, threads_p);
             pass_syscall = false;
             thread->custom_syscall_result = true;
 
-            int inner_fd = regs.rdi;
-            struct fd_t * fd; 
-            HASH_FIND_INT(thread->container->rfds, &inner_fd, fd);
-            if (fd == NULL) {
-                thread->syscall_result = -EBADF;
+            if (result) {
+                thread->syscall_result = 0;
             } else {
-                bool result = do_cnew(new_c, fd->fd, threads_p);
-                if (result) {
-                    thread->syscall_result = 0;
-                    HASH_DEL(thread->container->rfds, fd);
-                    free(fd);
-                } else {
-                    thread->syscall_result = -1;
-                    free(new_c);
-                }
+                fprintf(stderr, "TODO handle failed cnew\n");
+                thread->syscall_result = -1;
             }
             break;
 
         case SYS_write:
+            if (ptrace(
+                PTRACE_POKEUSER,
+                thread->tid,
+                offsetof(struct user, regs.rdi),
+                get_external_fd(thread->container->wfds, regs.rdi)
+            ) != 0)
+                err(EXIT_FAILURE, "failed map wfd");
+            pass_syscall = true;
+            break;
+
         case SYS_read:
+            if (ptrace(
+                PTRACE_POKEUSER,
+                thread->tid,
+                offsetof(struct user, regs.rdi),
+                get_external_fd(thread->container->rfds, regs.rdi)
+            ) != 0)
+                err(EXIT_FAILURE, "failed map rfd");
+            pass_syscall = true;
+            break;
 
         case SYS_mprotect:
         case SYS_munmap:
@@ -277,12 +342,9 @@ void handle_syscall_enter (struct th_t * thread, struct th_t * * threads_p) {
         case SYS_arch_prctl:
         case SYS_futex:
             pass_syscall = true;
-            thread->custom_syscall_result = false;
             break;
 
         default:
-            pass_syscall = false;
-            thread->custom_syscall_result = false;
             break;
     }
 
