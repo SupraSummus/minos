@@ -84,7 +84,7 @@ bool set_ptrace_options (pid_t pid) {
 }
 
 
-bool do_cnew (struct c_t * c, int rfd, struct th_t * * threads) {
+bool do_cnew (struct c_t * c, int rfd, struct th_t * * threads_p) {
     assert(c->threads == NULL);
     assert(c->thread_count == 0);
 
@@ -192,18 +192,116 @@ bool do_cnew (struct c_t * c, int rfd, struct th_t * * threads) {
     th->tid = pid;
     th->container = c;
     DL_APPEND(c->threads, th);
-    HASH_ADD_INT(*threads, tid, th);
+    HASH_ADD_INT(*threads_p, tid, th);
 
     // resume execution
     if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1) {
         kill(pid, SIGKILL);
         DL_DELETE(c->threads, th);
-        HASH_DEL(*threads, th);
+        HASH_DEL(*threads_p, th);
         free(th);
         return false;
     }
 
     return true;
+}
+
+
+void handle_syscall_enter (struct th_t * thread, struct th_t * * threads_p) {
+    assert(!thread->in_syscall);
+
+    /* Gather system call arguments */
+    struct user_regs_struct regs;
+    if (ptrace(PTRACE_GETREGS, thread->tid, 0, &regs) == -1)
+        err(EXIT_FAILURE, "failed to get child registers");
+
+    thread->in_syscall = true;
+    long syscall = regs.orig_rax;
+
+    bool pass_syscall = false;
+    int64_t word;
+    switch (syscall) {
+        case SYS_mmap:
+            // pass only when fd is -1 (we want to prevent real file maps)
+            pass_syscall = ((long)regs.r8 == -1);
+            thread->custom_syscall_result = false;
+            break;
+
+        case SYS_clone:
+            // check if flags are correct
+            word = regs.rdi;
+            pass_syscall = (
+                (word & CLONE_FILES) &&
+                !(word & CLONE_VFORK) &&
+                (word & CLONE_VM)
+            );
+            thread->custom_syscall_result = false;
+            break;
+
+        case SYS_cnew:
+            (void)1; // local var declaration cant be first
+            struct c_t * new_c = malloc(sizeof(struct c_t));
+            if (new_c == NULL) err(EXIT_FAILURE, "malloc failed");
+            container_init(new_c);
+            pass_syscall = false;
+            thread->custom_syscall_result = true;
+
+            int inner_fd = regs.rdi;
+            struct fd_t * fd; 
+            HASH_FIND_INT(thread->container->rfds, &inner_fd, fd);
+            if (fd == NULL) {
+                thread->syscall_result = -EBADF;
+            } else {
+                bool result = do_cnew(new_c, fd->fd, threads_p);
+                if (result) {
+                    thread->syscall_result = 0;
+                    HASH_DEL(thread->container->rfds, fd);
+                    free(fd);
+                } else {
+                    thread->syscall_result = -1;
+                    free(new_c);
+                }
+            }
+            break;
+
+        case SYS_write:
+        case SYS_read:
+
+        case SYS_mprotect:
+        case SYS_munmap:
+        case SYS_mremap:
+
+        case SYS_exit:
+        case SYS_gettid:
+        case SYS_set_tid_address:
+        case SYS_arch_prctl:
+        case SYS_futex:
+            pass_syscall = true;
+            thread->custom_syscall_result = false;
+            break;
+
+        default:
+            pass_syscall = false;
+            thread->custom_syscall_result = false;
+            break;
+    }
+
+    if (pass_syscall) {
+        if (DEBUG) fprintf(stderr, "%d pass %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
+            thread->tid,
+            syscall,
+            (long)regs.rdi, (long)regs.rsi, (long)regs.rdx,
+            (long)regs.r10, (long)regs.r8,  (long)regs.r9);
+    } else {
+        if (DEBUG) fprintf(stderr, "%d droping syscall %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
+            thread->tid,
+            syscall,
+            (long)regs.rdi, (long)regs.rsi, (long)regs.rdx,
+            (long)regs.r10, (long)regs.r8,  (long)regs.r9);
+        // set to invalid syscall
+        if (ptrace(PTRACE_POKEUSER, thread->tid, offsetof(struct user, regs.orig_rax), -1) != 0)
+            err(EXIT_FAILURE, "failed to stop syscall from happening (set %%RAX to -1)");
+    }
 }
 
 
@@ -307,93 +405,7 @@ void handle_syscalls(struct th_t * * threads_p) {
                 }
             } else {
                 // syscall enter
-                thread->in_syscall = true;
-                long syscall = regs.orig_rax;
-
-                bool pass_syscall = false;
-                int64_t word;
-                switch (syscall) {
-                    case SYS_mmap:
-                        // pass only when fd is -1 (we want to prevent real file maps)
-                        pass_syscall = ((long)regs.r8 == -1);
-                        thread->custom_syscall_result = false;
-                        break;
-
-                    case SYS_clone:
-                        // check if flags are correct
-                        word = regs.rdi;
-                        pass_syscall = (
-                            (word & CLONE_FILES) &&
-                            !(word & CLONE_VFORK) &&
-                            (word & CLONE_VM)
-                        );
-                        thread->custom_syscall_result = false;
-                        break;
-
-                    case SYS_cnew:
-                        (void)1; // local var declaration cant be first
-                        struct c_t * new_c = malloc(sizeof(struct c_t));
-                        if (new_c == NULL) err(EXIT_FAILURE, "malloc failed");
-                        container_init(new_c);
-                        pass_syscall = false;
-                        thread->custom_syscall_result = true;
-
-                        int inner_fd = regs.rdi;
-                        struct fd_t * fd; 
-                        HASH_FIND_INT(thread->container->rfds, &inner_fd, fd);
-                        if (fd == NULL) {
-                            thread->syscall_result = -EBADF;
-                        } else {
-                            bool result = do_cnew(new_c, fd->fd, threads_p);
-                            if (result) {
-                                thread->syscall_result = 0;
-                                HASH_DEL(thread->container->rfds, fd);
-                                free(fd);
-                            } else {
-                                thread->syscall_result = -1;
-                                free(new_c);
-                            }
-                        }
-                        break;
-
-                    case SYS_write:
-                    case SYS_read:
-
-                    case SYS_mprotect:
-                    case SYS_munmap:
-                    case SYS_mremap:
-
-                    case SYS_exit:
-                    case SYS_gettid:
-                    case SYS_set_tid_address:
-                    case SYS_arch_prctl:
-                    case SYS_futex:
-                        pass_syscall = true;
-                        thread->custom_syscall_result = false;
-                        break;
-
-                    default:
-                        pass_syscall = false;
-                        thread->custom_syscall_result = false;
-                        break;
-                }
-
-                if (pass_syscall) {
-                    if (DEBUG) fprintf(stderr, "%d pass %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
-                        pid,
-                        syscall,
-                        (long)regs.rdi, (long)regs.rsi, (long)regs.rdx,
-                        (long)regs.r10, (long)regs.r8,  (long)regs.r9);
-                } else {
-                    if (DEBUG) fprintf(stderr, "%d droping syscall %ld(%ld, %ld, %ld, %ld, %ld, %ld)\n",
-                        pid,
-                        syscall,
-                        (long)regs.rdi, (long)regs.rsi, (long)regs.rdx,
-                        (long)regs.r10, (long)regs.r8,  (long)regs.r9);
-                    // set to invalid syscall
-                    if (ptrace(PTRACE_POKEUSER, pid, offsetof(struct user, regs.orig_rax), -1) != 0)
-                        err(EXIT_FAILURE, "failed to stop syscall from happening (set %%RAX to -1)");
-                }
+                handle_syscall_enter(thread, threads_p);
             }
 
         } else if (siginfo.si_status == SIGSTOP) {
